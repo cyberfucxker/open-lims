@@ -1,0 +1,50 @@
+import type { AddressResult, Area } from "@/types";
+
+export const MOCK_ADDRESSES: AddressResult[] = [
+  {
+    id: "addr_1",
+    user_id: "user_1",
+    name: "HOME",
+    house_no: "402",
+    block_no: "Block C",
+    apartment: "Shreenath Residency",
+    address: "402, Shreenath Residency, Tonk Road",
+    locality: "Tonk Road",
+    landmark: "Near Gopalpura Bypass",
+    city: "Jaipur",
+    state: "Rajasthan",
+    pincode: "302018",
+    phone: "9876543210",
+    lat: "26.8615",
+    long: "75.8055",
+    is_default: true,
+    area_id: "area_1",
+  },
+  {
+    id: "addr_2",
+    user_id: "user_1",
+    name: "WORK",
+    house_no: "5th Floor",
+    block_no: null,
+    apartment: "Ganpati Plaza",
+    address: "5th Floor, Ganpati Plaza, MI Road",
+    locality: "MI Road",
+    landmark: "Opposite Rajmandir",
+    city: "Jaipur",
+    state: "Rajasthan",
+    pincode: "302001",
+    phone: "9876543210",
+    lat: "26.9157",
+    long: "75.8129",
+    is_default: false,
+    area_id: "area_2",
+  },
+];
+
+export const MOCK_AREAS: Area[] = [
+  { id: "area_1", name: "Tonk Road" },
+  { id: "area_2", name: "MI Road" },
+  { id: "area_3", name: "Vaishali Nagar" },
+  { id: "area_4", name: "Malviya Nagar" },
+  { id: "area_5", name: "C-Scheme" },
+];

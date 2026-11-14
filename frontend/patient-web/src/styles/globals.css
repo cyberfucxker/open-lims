@@ -1,0 +1,252 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --background: oklch(0.99 0.003 200);
+  --foreground: oklch(0.17 0.02 240);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.17 0.02 240);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.17 0.02 240);
+
+  --primary: oklch(0.5911 0.2414 29.31);
+  --primary-foreground: oklch(0.99 0 0);
+
+  --secondary: oklch(0.96 0.006 220);
+  --secondary-foreground: oklch(0.22 0.02 240);
+
+  --muted: oklch(0.96 0.006 220);
+  --muted-foreground: oklch(0.5 0.015 240);
+
+  --accent: oklch(0.94 0.03 29);
+  --accent-foreground: oklch(0.22 0.05 29);
+
+  --destructive: oklch(0.58 0.22 25);
+  --destructive-foreground: oklch(0.99 0 0);
+
+  --border: oklch(0.91 0.008 220);
+  --input: oklch(0.91 0.008 220);
+  --ring: oklch(0.5911 0.2414 29.31 / 50%);
+
+  --success: oklch(0.6 0.15 152);
+  --success-foreground: oklch(0.99 0 0);
+  --warning: oklch(0.75 0.16 75);
+  --warning-foreground: oklch(0.2 0.03 75);
+  --info: oklch(0.58 0.18 255);
+  --info-foreground: oklch(0.99 0 0);
+
+  --radius: 0.75rem;
+
+  --slate-950: oklch(0.19 0.02 240);
+  --slate-900: oklch(0.23 0.02 240);
+  --slate-800: oklch(0.28 0.02 240);
+  --brand-teal: oklch(0.55 0.13 192);
+  --brand-teal-light: oklch(0.7 0.11 190);
+  --brand-violet: oklch(0.53 0.22 300);
+  /* The deep blue the site footer is filled with. Kept as the exact hex the
+     footer already used rather than an oklch conversion, so the two surfaces
+     cannot drift apart by a rounding step. Not redefined for dark mode: the
+     footer does not change there either, and anything wearing this colour is
+     carrying the footer's blue on purpose. */
+  --brand-navy: #1e4169;
+
+  /* Fixed-height tab bar + safe-area inset, read by AppShell so page content
+     never sits under the notch/home-indicator on mobile devices. */
+  --bottom-tab-bar-height: 4rem;
+  --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+
+  /* Height of the full-bleed sticky desktop navbar, read by TopNav itself and by the
+     page-level sticky bars that offset against it at `md` and up. Change it here and
+     everything stays aligned instead of sliding underneath. TopNav is two stacked
+     rows now — utility bar (h-14 = 3.5rem) + section nav (h-11 = 2.75rem). */
+  --top-nav-height: 6.25rem;
+}
+
+.dark {
+  --background: oklch(0.16 0.018 240);
+  --foreground: oklch(0.96 0.004 220);
+  --card: oklch(0.2 0.02 240);
+  --card-foreground: oklch(0.96 0.004 220);
+  --popover: oklch(0.2 0.02 240);
+  --popover-foreground: oklch(0.96 0.004 220);
+
+  --primary: oklch(0.64 0.22 29);
+  --primary-foreground: oklch(0.99 0 0);
+
+  --secondary: oklch(0.25 0.02 240);
+  --secondary-foreground: oklch(0.92 0.004 220);
+
+  --muted: oklch(0.25 0.02 240);
+  --muted-foreground: oklch(0.66 0.015 220);
+
+  --accent: oklch(0.28 0.045 29);
+  --accent-foreground: oklch(0.9 0.03 29);
+
+  --destructive: oklch(0.63 0.21 25);
+  --destructive-foreground: oklch(0.99 0 0);
+
+  --border: oklch(0.31 0.02 240);
+  --input: oklch(0.31 0.02 240);
+  --ring: oklch(0.64 0.22 29 / 50%);
+
+  --success: oklch(0.65 0.15 152);
+  --success-foreground: oklch(0.12 0.03 152);
+  --warning: oklch(0.78 0.15 75);
+  --warning-foreground: oklch(0.18 0.03 75);
+  --info: oklch(0.66 0.16 255);
+  --info-foreground: oklch(0.13 0.03 255);
+
+  --slate-950: oklch(0.94 0.004 220);
+  --slate-900: oklch(0.88 0.008 220);
+  --slate-800: oklch(0.8 0.012 220);
+  --brand-teal: oklch(0.68 0.12 190);
+  --brand-teal-light: oklch(0.76 0.1 188);
+  --brand-violet: oklch(0.68 0.19 300);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
+
+  --color-slate-950: var(--slate-950);
+  --color-slate-900: var(--slate-900);
+  --color-slate-800: var(--slate-800);
+  --color-brand-teal: var(--brand-teal);
+  --color-brand-teal-light: var(--brand-teal-light);
+  --color-brand-violet: var(--brand-violet);
+  --color-brand-navy: var(--brand-navy);
+
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --animate-fade-in: fade-in 0.6s ease-out both;
+  --animate-fade-in-up: fade-in-up 0.7s cubic-bezier(0.16, 1, 0.3, 1) both;
+  --animate-scale-in: scale-in 0.4s cubic-bezier(0.16, 1, 0.3, 1) both;
+  --animate-float: float 8s ease-in-out infinite;
+  --animate-float-slow: float 12s ease-in-out infinite;
+  --animate-shimmer: shimmer 2s linear infinite;
+  --animate-gradient-shift: gradient-shift 6s ease-in-out infinite;
+
+  @keyframes fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  @keyframes fade-in-up {
+    from { opacity: 0; transform: translateY(16px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes scale-in {
+    from { opacity: 0; transform: scale(0.96); }
+    to { opacity: 1; transform: scale(1); }
+  }
+  @keyframes float {
+    0%, 100% { transform: translate(0, 0); }
+    50% { transform: translate(-2%, 3%); }
+  }
+  @keyframes shimmer {
+    from { background-position: -200% 0; }
+    to { background-position: 200% 0; }
+  }
+  @keyframes gradient-shift {
+    0%, 100% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+  html {
+    @apply font-sans;
+  }
+}
+
+@layer utilities {
+  .glass-panel {
+    background: color-mix(in oklch, white 88%, transparent);
+    backdrop-filter: blur(24px) saturate(160%);
+    -webkit-backdrop-filter: blur(24px) saturate(160%);
+    border: 1px solid color-mix(in oklch, white 40%, transparent);
+  }
+  .dark .glass-panel {
+    background: color-mix(in oklch, var(--card) 82%, transparent);
+    border: 1px solid color-mix(in oklch, white 12%, transparent);
+  }
+  .shimmer-bg {
+    background: linear-gradient(
+      90deg,
+      var(--muted) 25%,
+      color-mix(in oklch, var(--muted) 50%, white) 50%,
+      var(--muted) 75%
+    );
+    background-size: 200% 100%;
+    animation: var(--animate-shimmer);
+  }
+  .gradient-text {
+    color: var(--brand-teal);
+  }
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  /* Fully hidden scrollbar for carousel tracks that already have their own
+     arrow/dot navigation — a visible native scrollbar under those reads as
+     an unfinished control, not a premium one. */
+  .no-scrollbar {
+    scrollbar-width: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .safe-bottom {
+    padding-bottom: var(--safe-area-bottom);
+  }
+  .pb-tab-bar {
+    padding-bottom: calc(var(--bottom-tab-bar-height) + var(--safe-area-bottom));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

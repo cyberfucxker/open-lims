@@ -1,0 +1,40 @@
+{
+  "name": "open-lims",
+  "version": "0.1.0",
+  "license": "MIT",
+  "private": true,
+  "workspaces": [
+    "frontend",
+    "backend"
+  ],
+  "scripts": {
+    "dev": "concurrently -n backend,frontend,superadmin,patient -c blue,green,magenta,cyan \"npm run dev -w backend\" \"npm run dev -w frontend\" \"npm run dev:superadmin\" \"npm run dev:patient-web\"",
+    "dev:backend": "npm run dev -w backend",
+    "dev:frontend": "npm run dev -w frontend",
+    "dev:superadmin": "npm --prefix frontend/superadmin run dev",
+    "dev:patient-web": "npm --prefix frontend/patient-web run dev",
+    "build": "npm run build -w backend && npm run build -w frontend && npm run build:superadmin && npm run build:patient-web",
+    "build:superadmin": "npm --prefix frontend/superadmin run build",
+    "build:patient-web": "npm --prefix frontend/patient-web run build",
+    "lint": "npm run lint -w backend && npm run lint -w frontend && npm run lint:superadmin",
+    "lint:superadmin": "npm --prefix frontend/superadmin run lint",
+    "lint:fix": "npm run lint:fix -w backend && npm run lint:fix -w frontend && npm --prefix frontend/superadmin run lint:fix",
+    "format": "npm run format -w backend && npm run format -w frontend && npm --prefix frontend/superadmin run format",
+    "typecheck": "npm run typecheck -w backend && npm run typecheck -w frontend && npm --prefix frontend/superadmin run typecheck",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "husky": "^9.1.7",
+    "lint-staged": "^15.3.0"
+  },
+  "allowScripts": {
+    "sharp@0.34.5": true,
+    "unrs-resolver@1.12.2": true,
+    "esbuild@0.28.1": true,
+    "prisma@6.19.3": true,
+    "@prisma/client@6.19.3": true,
+    "@prisma/engines@6.19.3": true,
+    "fsevents@2.3.3": true
+  }
+}

@@ -1,0 +1,19 @@
+# Local development database for Open LIMS.
+#   docker compose up -d
+# Then set in backend/.env:
+#   DATABASE_URL="postgresql://lims_user:change-me@localhost:5432/open_lims?schema=public"
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: lims_user
+      POSTGRES_PASSWORD: change-me
+      POSTGRES_DB: open_lims
+    ports:
+      - "5432:5432"
+    volumes:
+      - open_lims_pgdata:/var/lib/postgresql/data
+
+volumes:
+  open_lims_pgdata:

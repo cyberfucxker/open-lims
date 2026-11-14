@@ -1,0 +1,3867 @@
+// This is your Prisma schema file.
+// Authentication module: roles, users, refresh tokens, password reset
+// tokens, and login history. Roles are data (a table), not a hardcoded
+// enum, so new roles can be added later with an INSERT — no migration and
+// no change to authentication/authorization logic.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pgcrypto]
+}
+
+enum LoginStatus {
+  SUCCESS
+  FAILED
+}
+
+model Role {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String   @unique @db.VarChar(50)
+  label     String   @db.VarChar(100)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  users User[]
+
+  @@map("roles")
+}
+
+model User {
+  id           String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  username     String    @unique @db.VarChar(100)
+  email        String?   @unique @db.VarChar(255)
+  passwordHash String    @map("password_hash")
+  fullName     String?   @map("full_name") @db.VarChar(150)
+  isActive     Boolean   @default(true) @map("is_active")
+  /// Superadmin modules a MANAGER login may use, e.g. ["orders","phlebos"]
+  /// (see `staffModule.middleware.ts`). Ignored for ADMIN (everything) and
+  /// FRANCHISE (its own portal). Read from the DB on every guarded request,
+  /// so revoking a module takes effect without the manager logging out.
+  staffModules Json      @default("[]") @map("staff_modules")
+  lastLoginAt  DateTime? @map("last_login_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  roleId String @map("role_id") @db.Uuid
+  role   Role   @relation(fields: [roleId], references: [id])
+
+  /// Set only for a B2B Organization's portal login (Collection Center staff
+  /// account). Unique+nullable enforces at most one login per Organization —
+  /// Postgres allows multiple NULLs under a unique constraint.
+  organizationId String?       @unique @map("organization_id") @db.Uuid
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+
+  refreshTokens       RefreshToken[]
+  passwordResetTokens PasswordResetToken[]
+  loginHistory        LoginHistory[]
+  testBranchUsers     TestBranchUser[]
+
+  @@index([roleId])
+  @@map("users")
+}
+
+/// Refresh tokens are opaque random strings; only a SHA-256 hash is
+/// persisted so a leaked database dump cannot be replayed as a session.
+model RefreshToken {
+  id                  String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tokenHash           String    @unique @map("token_hash")
+  expiresAt           DateTime  @map("expires_at")
+  revokedAt           DateTime? @map("revoked_at")
+  replacedByTokenHash String?   @map("replaced_by_token_hash")
+  createdByIp         String?   @map("created_by_ip") @db.VarChar(64)
+  userAgent           String?   @map("user_agent")
+  createdAt           DateTime  @default(now()) @map("created_at")
+
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+/// Same hashing approach as refresh tokens: only the SHA-256 hash of the
+/// emailed/returned reset token is stored.
+model PasswordResetToken {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+/// Append-only audit trail of login attempts, kept even when the username
+/// does not resolve to a user (userId nullable) so failed attempts against
+/// unknown usernames are still visible.
+model LoginHistory {
+  id        String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  username  String      @db.VarChar(100)
+  status    LoginStatus
+  reason    String?     @db.VarChar(100)
+  ipAddress String?     @map("ip_address") @db.VarChar(64)
+  userAgent String?     @map("user_agent")
+  createdAt DateTime    @default(now()) @map("created_at")
+
+  userId String? @map("user_id") @db.Uuid
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([username])
+  @@map("login_history")
+}
+
+/// The lab's own physical branch/collection center a walk-in patient is
+/// registered from (e.g. "Jaipur Main", "Vaishali Nagar Branch"). Distinct
+/// from `Organization` (external B2B referring entities like corporates/
+/// hospitals) and the Patient App's public `ServiceCenter` listing — this is
+/// purely internal, referenced by `Appointment.centerId`. Soft-deleted like
+/// Department so historical Appointments keep resolving.
+model Center {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String    @db.VarChar(150)
+  code      String?   @db.VarChar(20)
+  address   String?
+  city      String?   @db.VarChar(100)
+  active    Boolean   @default(true)
+  deletedAt DateTime? @map("deleted_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  appointments Appointment[]
+
+  @@map("centers")
+}
+
+/// Lab department master data (e.g. Hematology, Biochemistry). Editable via
+/// the Master Management screens; soft-deleted (never hard-deleted) so
+/// historical Tests that reference a department keep resolving.
+model Department {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name        String    @db.VarChar(100)
+  code        String?   @db.VarChar(20)
+  description String?
+  active      Boolean   @default(true)
+  deletedAt   DateTime? @map("deleted_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  categories Category[]
+  tests      Test[]
+  parameters Parameter[]
+
+  @@map("departments")
+}
+
+/// Test category master data, scoped to a Department (e.g. "Liver Function"
+/// under Biochemistry). Soft-deleted like Department.
+model Category {
+  id           String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  departmentId String    @map("department_id") @db.Uuid
+  name         String    @db.VarChar(100)
+  code         String?   @db.VarChar(20)
+  description  String?
+  active       Boolean   @default(true)
+  deletedAt    DateTime? @map("deleted_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  department Department @relation(fields: [departmentId], references: [id], onDelete: Restrict)
+  tests      Test[]
+
+  @@index([departmentId])
+  @@map("categories")
+}
+
+/// Specimen/sample type master data (e.g. Blood, Urine, Serum). Soft-deleted
+/// like Department/Category.
+model SampleType {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name        String    @db.VarChar(100)
+  description String?
+  active      Boolean   @default(true)
+  deletedAt   DateTime? @map("deleted_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  tests         Test[]
+  parameters    Parameter[]
+  packages      Package[]
+  barcodeConfig SampleTypeBarcodeConfig?
+  samples       Sample[]
+
+  @@map("sample_types")
+}
+
+/// Where a specimen for this item can be collected. Distinct from
+/// `Appointment.homeCollection`, which records what actually happened on one
+/// visit — this is the catalogue-level statement of what's offered.
+enum SampleCollectionMode {
+  HOME
+  LAB
+  BOTH
+
+  @@map("sample_collection_mode")
+}
+
+/// Who a catalogue item is clinically recommended for. `BOTH` is the default
+/// rather than a nullable column: "not sex-specific" is a real answer, not
+/// missing data.
+enum RecommendedGender {
+  MALE
+  FEMALE
+  BOTH
+
+  @@map("recommended_gender")
+}
+
+/// The atomic analyte the lab actually measures (e.g. Hemoglobin, TSH) — the
+/// reusable building block a `Test` profile is composed of, and the level the
+/// patient app renders as a line item.
+///
+/// `doTest` is the bookability switch: true means this Parameter may ALSO be
+/// sold on its own (so it can be pulled straight into a `Package` and shown
+/// with a "+ Add" affordance in the app); false means it only ever exists
+/// nested inside a Test/Package and is never billed alone.
+///
+/// The booking-facing fields below (`sampleTypeId`, `appCategoryId`,
+/// `reportTime`, `sampleCollection`, fasting, recommended-for/age,
+/// `description`, `sampleReportUrl`) describe the Parameter as a sellable item
+/// in its own right — a Parameter sold standalone needs its own specimen,
+/// turnaround, and prep instructions, and can't borrow the hosting Test's.
+/// `TestParameter` still carries the per-Test REPORTING context (unit,
+/// reference range, formula), which is a different thing: the same analyte is
+/// printed with different ranges depending on the profile reporting it.
+///
+/// The FKs are nullable because an analyte that only ever appears nested inside
+/// a Test (`doTest = false`) genuinely has no independent specimen or category
+/// — the admin form requires them, but the column doesn't force invented data
+/// on a purely-nested row.
+model Parameter {
+  id                String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name              String               @db.VarChar(150)
+  shortName         String               @unique @map("short_name") @db.VarChar(30)
+  /// Catalogue MRP — surfaced as "MRP" in the admin form and struck through in
+  /// the patient app, with `offerPrice` as the actual selling price.
+  price             Decimal              @db.Decimal(10, 2)
+  offerPrice        Decimal?             @map("offer_price") @db.Decimal(10, 2)
+  doTest            Boolean              @default(false) @map("do_test")
+  sampleTypeId      String?              @map("sample_type_id") @db.Uuid
+  /// The lab's INTERNAL taxonomy (BIOCHEMISTRY, HAEMATOLOGY, …) — same
+  /// `Department` table `Test.departmentId` uses, kept for CSV import
+  /// fidelity from labs that maintain it. Purely informational here (nothing
+  /// in the app or report pipeline reads a standalone Parameter's
+  /// department); not to be confused with `appCategoryId` below, the
+  /// merchandising tile.
+  departmentId      String?              @map("department_id") @db.Uuid
+  /// The patient-app/CMS category tile this analyte is listed under (Thyroid,
+  /// Liver, …) — `AppCategory`, managed from CMS → Categories. Deliberately NOT
+  /// the department-scoped lab `Category` that `Test` uses: that one is an
+  /// internal lab taxonomy, this one is merchandising.
+  appCategoryId     String?              @map("app_category_id") @db.Uuid
+  reportTime        String?              @map("report_time") @db.VarChar(50)
+  sampleCollection  SampleCollectionMode @default(BOTH) @map("sample_collection")
+  isFastingRequired Boolean              @default(false) @map("is_fasting_required")
+  fastingHours      Int?                 @map("fasting_hours")
+  /// Days after the report is ready to remind the patient to repeat this
+  /// (push + WhatsApp, see `services/whatsapp/followUp.service.ts`). Null = never.
+  followUpDays      Int?                 @map("follow_up_days")
+  /// WhatsApp template for that reminder; null = `test_repeat_reminder`.
+  followUpTemplate  String?              @map("follow_up_template") @db.VarChar(100)
+  recommendedFor    RecommendedGender    @default(BOTH) @map("recommended_for")
+  /// Free text ("18+ years", "2–12 years") rather than a numeric range: real
+  /// recommendations are written this way and don't always reduce to min/max.
+  recommendedAge    String?              @map("recommended_age") @db.VarChar(60)
+  /// Rich text (HTML) authored in the Superadmin editor, same convention as
+  /// `CmsPage.content`.
+  description       String?
+  /// Optional specimen report PDF/image an admin uploads so patients can see
+  /// what the output looks like. Path under `/uploads`, same as CMS assets.
+  sampleReportUrl   String?              @map("sample_report_url")
+  active            Boolean              @default(true)
+  /// Curated "actually order this a lot" flag — deliberately separate from
+  /// `doTest` (which only gates being sellable standalone at all). With
+  /// hundreds of `doTest` Parameters each auto-provisioning a shadow Test
+  /// (see `Test.sourceParameterId`), showing every one of them in the
+  /// patient app's Tests list would bury the curated catalogue under
+  /// obscure analytes nobody searches for by name. `catalog.service.ts`'s
+  /// `listTests` only includes a shadow Test when its source Parameter has
+  /// this on — real Tests are unaffected either way. Defaults `false`;
+  /// admin-set from the Parameter form, same as `Package.isPopular`.
+  isCommonlyUsed    Boolean              @default(false) @map("is_commonly_used")
+  /// Admin-set manual ordering for the Superadmin Parameters list only
+  /// (ascending; ties break on name) — same convention as `Package.sortOrder`.
+  sortOrder         Int                  @default(0) @map("sort_order")
+  /// Plain sequential display number ("S.No" in the admin UI) — see
+  /// `Package.serialNo`'s doc-comment for the exact same convention.
+  serialNo          Int                  @unique @default(autoincrement()) @map("serial_no")
+  createdAt         DateTime             @default(now()) @map("created_at")
+  updatedAt         DateTime             @updatedAt @map("updated_at")
+
+  sampleType        SampleType?        @relation(fields: [sampleTypeId], references: [id], onDelete: Restrict)
+  department        Department?        @relation(fields: [departmentId], references: [id], onDelete: Restrict)
+  appCategory       AppCategory?       @relation(fields: [appCategoryId], references: [id], onDelete: Restrict)
+  testParameters    TestParameter[]
+  packageParameters PackageParameter[]
+  /// The auto-provisioned single-parameter `Test` that makes this analyte
+  /// directly bookable through the normal Test pipeline — see
+  /// `Test.sourceParameterId`'s doc-comment. Null until `doTest` is first
+  /// turned on (or, for the analytes that predate this feature, until the
+  /// one-off backfill in `prisma/backfillShadowTests.ts` runs).
+  shadowTest        Test?
+
+  @@index([doTest])
+  @@index([active])
+  @@index([isCommonlyUsed])
+  @@index([sampleTypeId])
+  @@index([appCategoryId])
+  @@index([departmentId])
+  @@map("parameters")
+}
+
+/// Lab test catalogue entry, a.k.a. "profile" — a named, priced panel of
+/// `Parameter`s (via `TestParameter`) that share one specimen and one reporting
+/// turnaround. `department`/`category`/`sampleType` are foreign keys into their
+/// respective master tables (not free text) so the catalogue can't drift from
+/// the managed reference lists. `status` stays a plain string rather than an
+/// enum since it's just a two-value toggle.
+///
+/// `shortName` is DB-unique because it's the write-time key the admin UI and
+/// CSV import resolve Package membership against; case-insensitive collisions
+/// are rejected in `test.service.ts` on top of this exact-match constraint.
+///
+/// A Test with zero `parameters` is fully supported and keeps Report Entry on
+/// its single free-text `ReportTestResult.resultValue` line — see
+/// `TestParameter`'s doc-comment.
+model Test {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name          String   @db.VarChar(200)
+  /// URL-safe, unique, generated from `name` once at creation and never
+  /// re-derived on rename (a changed slug would 404 every link/search result
+  /// already pointing at the old one) — see `utils/slug.util.ts`.
+  slug          String   @unique @db.VarChar(220)
+  shortName     String   @unique @map("short_name") @db.VarChar(30)
+  /// The lab's INTERNAL taxonomy, and the only thing the printed report groups
+  /// results by (see `reportPdf.service.ts`). Now nullable because the admin Test
+  /// form categorises by `appCategoryId` instead — a Test created there has no
+  /// department, and the report falls back to its CMS category name. Still
+  /// settable via CSV import for labs that maintain the internal taxonomy.
+  departmentId  String?  @map("department_id") @db.Uuid
+  /// Department-scoped lab category. Nullable for the same reason as
+  /// `departmentId`, and only meaningful alongside one.
+  categoryId    String?  @map("category_id") @db.Uuid
+  /// The patient-app/CMS category tile this Test is listed under — the "Category"
+  /// dropdown in the admin form, and the same taxonomy `Parameter` uses, so a
+  /// Test and a standalone Parameter appear under the same tile.
+  appCategoryId String?  @map("app_category_id") @db.Uuid
+  sampleTypeId  String   @map("sample_type_id") @db.Uuid
+  price         Decimal  @db.Decimal(10, 2)
+  reportTime    String   @map("report_time") @db.VarChar(50)
+  status        String   @default("Active") @db.VarChar(20)
+  description   String?
+  /// Long-form SEO page body (admin-authored HTML) shown on the website's
+  /// test detail page under a "Read more" fold — separate from the short
+  /// `description` the patient app shows. May contain the literal token
+  /// `[LOCATION]`, replaced with the page's city name at read time (see
+  /// `catalogDetail.service.ts#fillLocation`).
+  content       String?
+  offerPrice    Decimal? @map("offer_price") @db.Decimal(10, 2)
+  isPopular     Boolean  @default(false) @map("is_popular")
+  bookedCount   Int      @default(0) @map("booked_count")
+  /// Admin-set manual ordering for the Superadmin Tests list only (ascending;
+  /// ties break on name) — same convention as `Package.sortOrder`. Applies to
+  /// every Test row including auto-provisioned shadow Tests, same as
+  /// `serialNo` below; Superadmin's own list already filters those out (see
+  /// `test.repository.ts#buildWhere`), so this only ever surfaces for real,
+  /// hand-managed Tests.
+  sortOrder     Int      @default(0) @map("sort_order")
+  /// Plain sequential display number ("S.No" in the admin UI) — see
+  /// `Package.serialNo`'s doc-comment for the exact same convention.
+  serialNo      Int      @unique @default(autoincrement()) @map("serial_no")
+
+  /// Patient-facing prep and recommendation, mirroring `Parameter`'s own fields
+  /// so a Test and a standalone Parameter present identically in the app.
+  isFastingRequired Boolean           @default(false) @map("is_fasting_required")
+  fastingHours      Int?              @map("fasting_hours")
+  /// Days after the report is ready to remind the patient to repeat this
+  /// (push + WhatsApp, see `services/whatsapp/followUp.service.ts`). Null = never.
+  followUpDays      Int?              @map("follow_up_days")
+  /// WhatsApp template for that reminder; null = `test_repeat_reminder`.
+  followUpTemplate  String?           @map("follow_up_template") @db.VarChar(100)
+  recommendedFor    RecommendedGender @default(BOTH) @map("recommended_for")
+  recommendedAge    String?           @map("recommended_age") @db.VarChar(60)
+  /// Optional specimen report PDF/image, path under `/uploads`.
+  sampleReportUrl   String?           @map("sample_report_url")
+
+  /// Set only on a Test that `shadowTest.service.ts` auto-provisioned to make
+  /// one directly-bookable Parameter (`doTest = true`) sellable through the
+  /// app — the entire Test/Package booking pipeline (billing, appointments,
+  /// sample collection, report generation) is keyed on `Test.id`, so rather
+  /// than teach every one of those a second, parallel Parameter-based path,
+  /// a bookable Parameter gets a normal one-parameter Test standing in for
+  /// it and everything downstream stays exactly as it already was. `@unique`
+  /// enforces at most one shadow Test per Parameter (find-or-create key);
+  /// `onDelete: Cascade` removes the shadow Test if the Parameter itself is
+  /// ever hard-deleted, same lifecycle as the analyte it exists only to sell.
+  /// Superadmin's own Tests list filters these out by default (see
+  /// `test.repository.ts#listTests`) so they don't clutter the curated list
+  /// admins actually manage — they still fully participate in every booking
+  /// path, just aren't hand-edited there.
+  sourceParameterId String? @unique @map("source_parameter_id") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  department      Department?  @relation(fields: [departmentId], references: [id], onDelete: Restrict)
+  category        Category?    @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  appCategory     AppCategory? @relation(fields: [appCategoryId], references: [id], onDelete: Restrict)
+  sampleType      SampleType   @relation(fields: [sampleTypeId], references: [id], onDelete: Restrict)
+  sourceParameter Parameter?   @relation(fields: [sourceParameterId], references: [id], onDelete: Cascade)
+
+  appointmentTests  AppointmentTest[]
+  sampleRule        TestSampleRule?
+  resultConfig      TestResultConfig?
+  sampleTests       SampleTest[]
+  reportTestResults ReportTestResult[]
+  packageTests      PackageTest[]
+  parameters        TestParameter[]
+  branchUsers       TestBranchUser[]
+
+  @@index([departmentId])
+  @@index([categoryId])
+  @@index([appCategoryId])
+  @@index([sampleTypeId])
+  @@index([status])
+  @@map("tests")
+}
+
+/// Which branch logins a Test is offered at. A Test with NO rows here is
+/// available at every branch — an empty set means "unrestricted", not "nowhere",
+/// because that's the default an admin who never touches the field expects.
+///
+/// `userId` points at a FRANCHISE-role `User` (a branch/collection-center portal
+/// login). The role isn't expressible as an FK constraint — roles live in a table,
+/// not an enum — so `test.service.ts` validates it on write.
+model TestBranchUser {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  testId    String   @map("test_id") @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+
+  test Test @relation(fields: [testId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([testId, userId])
+  @@index([testId])
+  @@index([userId])
+  @@map("test_branch_users")
+}
+
+/// A bundle sold at a flat price (e.g. "Full Body Checkup") — made up of whole
+/// `Test` profiles (`packageTests`) plus any independently-bookable
+/// `Parameter`s (`packageParameters`, restricted to `doTest = true` rows by
+/// `package.service.ts`). Membership is always stored as FK relations; short
+/// names are a write-time convenience only and are never matched at read or
+/// billing time.
+///
+/// `price` is catalogue/reference-only — selecting a package during Patient
+/// Registration adds its tests at their own individual `Test.price`, it does
+/// not charge this flat price (see PatientRegistration billing).
+/// Soft-deletable like `PriceList`, unlike `Test` itself.
+model Package {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name        String    @db.VarChar(150)
+  /// See `Test.slug`'s doc-comment — same rules (unique, creation-time only).
+  slug        String    @unique @db.VarChar(220)
+  price       Decimal   @db.Decimal(10, 2)
+  active      Boolean   @default(true)
+  deletedAt   DateTime? @map("deleted_at")
+  /// Admin-set manual ordering for the Superadmin Packages list only (ascending;
+  /// ties break on name) — a curation control independent of `bookedCount`,
+  /// which is what the *patient app's* catalogue sorts by instead. See
+  /// `package.repository.ts#buildOrderBy`.
+  sortOrder   Int       @default(0) @map("sort_order")
+  /// Plain sequential display number ("S.No" in the admin UI) — 1, 2, 3, ...
+  /// in creation order. Backed by a DB sequence (`autoincrement()`), never
+  /// admin-set and never reused, unlike `sortOrder` above.
+  serialNo    Int       @unique @default(autoincrement()) @map("serial_no")
+  /// Patient App catalog fields — same convention as Test's additions above.
+  offerPrice  Decimal?  @map("offer_price") @db.Decimal(10, 2)
+  isPopular   Boolean   @default(false) @map("is_popular")
+  bookedCount Int       @default(0) @map("booked_count")
+
+  /// The CMS category tile this package is listed under — same taxonomy `Test`
+  /// and `Parameter` use, so all three appear under the same tiles in the app.
+  appCategoryId String? @map("app_category_id") @db.Uuid
+  /// The package's DECLARED primary specimen. A package's member tests each carry
+  /// their own `sampleTypeId` and are what actually drive sample collection; this
+  /// is the single specimen shown on the package card ("Blood"), which is why it's
+  /// nullable rather than derived — a mixed-specimen package has no single answer.
+  sampleTypeId  String? @map("sample_type_id") @db.Uuid
+  /// Rich text (HTML), same convention as `CmsPage.content`.
+  description   String?
+  /// Declared turnaround for the package as a whole. When null, the app falls
+  /// back to the slowest-listed member test's own `reportTime` (the pre-existing
+  /// behaviour — see `catalog.service.ts#listPackages`).
+  reportTime    String? @map("report_time") @db.VarChar(50)
+
+  isFastingRequired Boolean           @default(false) @map("is_fasting_required")
+  fastingHours      Int?              @map("fasting_hours")
+  /// Days after the report is ready to remind the patient to repeat this
+  /// (push + WhatsApp, see `services/whatsapp/followUp.service.ts`). Null = never.
+  followUpDays      Int?              @map("follow_up_days")
+  /// WhatsApp template for that reminder; null = `test_repeat_reminder`.
+  followUpTemplate  String?           @map("follow_up_template") @db.VarChar(100)
+  recommendedFor    RecommendedGender @default(BOTH) @map("recommended_for")
+  recommendedAge    String?           @map("recommended_age") @db.VarChar(60)
+  /// Optional specimen report PDF/image, path under `/uploads`.
+  sampleReportUrl   String?           @map("sample_report_url")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  appCategory       AppCategory?         @relation(fields: [appCategoryId], references: [id], onDelete: Restrict)
+  sampleType        SampleType?          @relation(fields: [sampleTypeId], references: [id], onDelete: Restrict)
+  packageTests      PackageTest[]
+  packageParameters PackageParameter[]
+  webBanners        WebBanner[]
+  landingPages      LandingPagePackage[]
+
+  @@index([name])
+  @@index([appCategoryId])
+  @@index([sampleTypeId])
+  @@map("packages")
+}
+
+/// Package <-> Test mapping only — the Test catalogue itself lives entirely
+/// in the existing `tests` table/module, same convention as `AppointmentTest`.
+model PackageTest {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  packageId String   @map("package_id") @db.Uuid
+  testId    String   @map("test_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+
+  package Package @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  test    Test    @relation(fields: [testId], references: [id], onDelete: Restrict)
+
+  @@unique([packageId, testId])
+  @@index([packageId])
+  @@index([testId])
+  @@map("package_tests")
+}
+
+/// Package <-> standalone Parameter mapping — the sibling of `PackageTest` for
+/// analytes a package sells directly rather than through a Test profile. Only
+/// `Parameter.doTest = true` rows may be linked here (enforced in
+/// `package.service.ts`, not by the schema, so flipping `doTest` off later
+/// doesn't corrupt an existing package silently — it surfaces on next save).
+model PackageParameter {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  packageId   String   @map("package_id") @db.Uuid
+  parameterId String   @map("parameter_id") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  package   Package   @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  parameter Parameter @relation(fields: [parameterId], references: [id], onDelete: Restrict)
+
+  @@unique([packageId, parameterId])
+  @@index([packageId])
+  @@index([parameterId])
+  @@map("package_parameters")
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+/// Whether a patient is billed as a walk-in retail customer or through a
+/// linked B2B Organization — independent of whether `organizationId` is
+/// actually set (a B2B patient type without a chosen organization yet is
+/// still valid mid-registration).
+enum PatientType {
+  RETAIL
+  B2B
+}
+
+enum AppointmentStatus {
+  REGISTERED
+  /// Patient App order lifecycle states — a walk-in Appointment created by
+  /// staff never passes through these (it starts at REGISTERED and is
+  /// already-paid-for-in-person), but the app's booking flow needs to
+  /// represent "booked but not yet en-route"/"phlebotomist en-route" before
+  /// SAMPLE_COLLECTED, on the same enum the admin portal already renders.
+  CONFIRMED
+  REACHED
+  SAMPLE_COLLECTED
+  PROCESSING
+  COMPLETED
+  CANCELLED
+}
+
+/// ONLINE was added for Bill payments (Cash/Card/UPI/Online) — Insurance/Credit
+/// remain valid only as an Appointment's original booking-time payment mode.
+/// WALLET was added for the Patient App — a Payment row with this mode
+/// records money settled from the patient's `Wallet` balance at order
+/// confirmation, reusing this exact same Bill/Payment ledger rather than a
+/// parallel app-only record of "how this bill got paid."
+enum PaymentMode {
+  CASH
+  CARD
+  UPI
+  INSURANCE
+  CREDIT
+  ONLINE
+  WALLET
+}
+
+enum PaymentStatus {
+  PAID
+  PARTIAL
+  PENDING
+}
+
+enum BillStatus {
+  ACTIVE
+  CANCELLED
+}
+
+enum SendChannel {
+  WHATSAPP
+  EMAIL
+  SMS
+}
+
+enum SendStatus {
+  SENT
+  FAILED
+}
+
+/// A patient registered once, who may return for many appointments/visits.
+/// `patientId` is the human-readable, barcode-friendly identifier (e.g.
+/// "LAB000123") minted from a DB sequence — see `patient_id_seq` in the
+/// migration — so it stays unique and gap-free under concurrent
+/// registrations, unlike a `count()+1` approach. Duplicate patients are
+/// prevented at the service layer (same mobile + name), not by a DB unique
+/// constraint on mobile, since two real patients can legitimately share a
+/// mobile number (e.g. family members).
+model Patient {
+  id                String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  patientId         String      @unique @map("patient_id") @db.VarChar(20)
+  optionalPatientId String?     @map("optional_patient_id") @db.VarChar(50)
+  title             String      @db.VarChar(20)
+  firstName         String      @map("first_name") @db.VarChar(100)
+  lastName          String      @map("last_name") @db.VarChar(100)
+  gender            Gender
+  patientType       PatientType @default(RETAIL) @map("patient_type")
+  dob               DateTime    @db.Date
+  mobile            String      @db.VarChar(15)
+  email             String?     @db.VarChar(255)
+  address           String?
+  organization      String?     @db.VarChar(150)
+  referral          String?     @db.VarChar(150)
+  whatsappOptIn     Boolean     @default(false) @map("whatsapp_opt_in")
+  smsOptIn          Boolean     @default(false) @map("sms_opt_in")
+  emailOptIn        Boolean     @default(false) @map("email_opt_in")
+  createdAt         DateTime    @default(now()) @map("created_at")
+  updatedAt         DateTime    @updatedAt @map("updated_at")
+
+  /// New normalized B2B link, added alongside the legacy free-text
+  /// `organization` column above (left untouched — no backfill). Populated
+  /// going forward for patients registered by/for a real Organization, e.g.
+  /// every patient a Collection Center portal user registers.
+  organizationId  String?       @map("organization_id") @db.Uuid
+  organizationRef Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+
+  /// Structured link to the Marketing Staff module's ReferralDoctor,
+  /// added alongside the legacy free-text `referral` column above (left
+  /// untouched — no backfill). Powers exact revenue attribution in the
+  /// Marketing Staff Monthly Report/Leaderboard/Commission calculations.
+  referralDoctorId  String?         @map("referral_doctor_id") @db.Uuid
+  referralDoctorRef ReferralDoctor? @relation(fields: [referralDoctorId], references: [id], onDelete: SetNull)
+
+  /// Structured link to the (fully separate) Referral Management module's
+  /// ReferralSource — a third, independent referral concept alongside
+  /// `referral` (legacy free text) and `referralDoctorId` (Marketing Staff
+  /// module). Powers automatic revenue/commission attribution for that
+  /// module's incentives/settlements/dashboard.
+  referralSourceId  String?         @map("referral_source_id") @db.Uuid
+  referralSourceRef ReferralSource? @relation(fields: [referralSourceId], references: [id], onDelete: SetNull)
+
+  appointments       Appointment[]
+  referralIncentives ReferralIncentive[]
+  /// Set only when this Patient was created via the Patient App as a
+  /// family member (including the account holder's own "Self" row) —
+  /// null for every Patient registered the normal walk-in/portal way.
+  appFamilyMember    FamilyMember?
+
+  @@index([mobile])
+  @@index([optionalPatientId])
+  @@index([organization])
+  @@index([referral])
+  @@index([organizationId])
+  @@index([referralDoctorId])
+  @@index([referralSourceId])
+  @@map("patients")
+}
+
+/// One visit/order for a patient — tests, billing and payment are scoped
+/// here, never on `Patient`, so a returning patient can have many
+/// appointments without any duplication of their identity data.
+/// `subtotal`/`discountAmount`/`netAmount`/`dueAmount`/`paymentStatus` are
+/// always computed server-side from the live `Test.price` of the selected
+/// tests (see `appointment.service.ts`) — never trusted from the client.
+model Appointment {
+  id              String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  appointmentNo   String            @unique @map("appointment_no") @db.VarChar(20)
+  patientId       String            @map("patient_id") @db.Uuid
+  status          AppointmentStatus @default(REGISTERED)
+  appointmentDate DateTime          @default(now()) @map("appointment_date")
+  subtotal        Decimal           @db.Decimal(10, 2)
+  discountPercent Decimal           @default(0) @map("discount_percent") @db.Decimal(5, 2)
+  discountAmount  Decimal           @map("discount_amount") @db.Decimal(10, 2)
+  netAmount       Decimal           @map("net_amount") @db.Decimal(10, 2)
+  paymentMode     PaymentMode       @map("payment_mode")
+  amountPaid      Decimal           @default(0) @map("amount_paid") @db.Decimal(10, 2)
+  dueAmount       Decimal           @map("due_amount") @db.Decimal(10, 2)
+  paymentStatus   PaymentStatus     @map("payment_status")
+  isEmergency     Boolean           @default(false) @map("is_emergency")
+  /// Which of the lab's own branches this visit was registered at — null for
+  /// a single-center setup or any Appointment predating this field.
+  centerId        String?           @map("center_id") @db.Uuid
+  /// Whether the sample for this specific visit is collected at the
+  /// patient's home rather than at the center — a per-visit choice, not a
+  /// standing Patient preference.
+  homeCollection  Boolean           @default(false) @map("home_collection")
+  createdByUserId String?           @map("created_by_user_id") @db.Uuid
+  createdAt       DateTime          @default(now()) @map("created_at")
+  updatedAt       DateTime          @updatedAt @map("updated_at")
+
+  patient             Patient              @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  center              Center?              @relation(fields: [centerId], references: [id], onDelete: SetNull)
+  tests               AppointmentTest[]
+  bill                Bill?
+  samples             Sample[]
+  report              Report?
+  /// Set only when this Appointment was created by the Patient App's order
+  /// checkout — links it back to the app's AppOrder + which family member
+  /// it's for. Null for every walk-in/portal-created Appointment.
+  appOrderAppointment AppOrderAppointment?
+
+  @@index([patientId])
+  @@index([status])
+  @@index([appointmentDate])
+  @@index([centerId])
+  @@map("appointments")
+}
+
+/// Appointment <-> Test mapping only — the Test catalogue itself lives
+/// entirely in the existing `tests` table/module. `testName`/`price` are
+/// snapshotted at booking time so a later Test rename or price change never
+/// alters a historical bill.
+model AppointmentTest {
+  id            String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  appointmentId String  @map("appointment_id") @db.Uuid
+  testId        String  @map("test_id") @db.Uuid
+  testName      String  @map("test_name") @db.VarChar(200)
+  price         Decimal @db.Decimal(10, 2)
+
+  appointment      Appointment       @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  test             Test              @relation(fields: [testId], references: [id], onDelete: Restrict)
+  sampleTest       SampleTest?
+  reportTestResult ReportTestResult?
+
+  @@unique([appointmentId, testId])
+  @@index([appointmentId])
+  @@index([testId])
+  @@map("appointment_tests")
+}
+
+/// The invoice/ledger for one Appointment (1:1) — created automatically the
+/// moment the Appointment is, so every visit has a bill immediately. Owns the
+/// *final* billing truth (net/paid/due/paymentStatus including any additional
+/// charges added later at the billing desk); `Appointment`'s own billing
+/// fields stay frozen at their original at-booking computation. "Free" and
+/// "Cancelled" are derived views (netAmount = 0 / status = CANCELLED), not
+/// stored as separate states, so there is exactly one source of truth.
+model Bill {
+  id                String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  billNo            String        @unique @map("bill_no") @db.VarChar(20)
+  appointmentId     String        @unique @map("appointment_id") @db.Uuid
+  status            BillStatus    @default(ACTIVE)
+  additionalCharges Decimal       @default(0) @map("additional_charges") @db.Decimal(10, 2)
+  netAmount         Decimal       @map("net_amount") @db.Decimal(10, 2)
+  amountPaid        Decimal       @default(0) @map("amount_paid") @db.Decimal(10, 2)
+  dueAmount         Decimal       @map("due_amount") @db.Decimal(10, 2)
+  paymentStatus     PaymentStatus @map("payment_status")
+  printCount        Int           @default(0) @map("print_count")
+  lastPrintedAt     DateTime?     @map("last_printed_at")
+  createdByUserId   String?       @map("created_by_user_id") @db.Uuid
+  createdAt         DateTime      @default(now()) @map("created_at")
+  updatedAt         DateTime      @updatedAt @map("updated_at")
+
+  appointment       Appointment        @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  payments          Payment[]
+  sendLogs          InvoiceSendLog[]
+  referralIncentive ReferralIncentive?
+
+  @@index([status])
+  @@index([paymentStatus])
+  @@index([createdAt])
+  @@map("bills")
+}
+
+/// Append-only payment history for a Bill — a bill can be settled across
+/// several payments (e.g. partial cash now, UPI later), each kept as its own
+/// row instead of overwriting a single `amountPaid` field, so the full ledger
+/// is always reconstructable.
+model Payment {
+  id               String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  billId           String      @map("bill_id") @db.Uuid
+  amount           Decimal     @db.Decimal(10, 2)
+  mode             PaymentMode
+  transactionId    String?     @map("transaction_id") @db.VarChar(100)
+  paymentDate      DateTime    @default(now()) @map("payment_date")
+  recordedByUserId String?     @map("recorded_by_user_id") @db.Uuid
+  createdAt        DateTime    @default(now()) @map("created_at")
+
+  bill Bill @relation(fields: [billId], references: [id], onDelete: Cascade)
+
+  @@index([billId])
+  @@map("payments")
+}
+
+/// Delivery log for the Send Invoice feature (WhatsApp/Email/SMS) — recorded
+/// regardless of outcome so failed sends are visible, not just successes.
+model InvoiceSendLog {
+  id           String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  billId       String      @map("bill_id") @db.Uuid
+  channel      SendChannel
+  recipient    String      @db.VarChar(255)
+  status       SendStatus
+  errorMessage String?     @map("error_message")
+  sentAt       DateTime    @default(now()) @map("sent_at")
+
+  bill Bill @relation(fields: [billId], references: [id], onDelete: Cascade)
+
+  @@index([billId])
+  @@map("invoice_send_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Sample Collection + Report Generation modules
+// ---------------------------------------------------------------------------
+
+enum SampleStatus {
+  PENDING
+  COLLECTED
+  RECEIVED
+  APPROVED
+  REJECTED
+  PROCESSING
+  COMPLETED
+}
+
+enum ReportStatus {
+  PENDING
+  RECEIVED
+  PROCESSING
+  PARTIAL
+  APPROVED
+  SUBMITTED
+  PRINTED
+  CANCELLED
+}
+
+/// Per-test workflow, independent per `ReportTestResult` row — a patient's
+/// 5 ordered tests each progress through this independently. `Report.status`
+/// itself stays a derived rollup of these (see
+/// `report.service.ts#recomputeReportStatus`), so the existing whole-report
+/// tabs/audit-log/PDF flows keep working unchanged.
+enum TestReportStatus {
+  PENDING
+  IN_PROGRESS
+  SUBMITTED
+  APPROVED
+  REJECTED
+  PRINTED
+}
+
+enum TemperatureRequirement {
+  ROOM_TEMPERATURE
+  REFRIGERATED_2_8
+  FROZEN_MINUS20
+  FROZEN_MINUS80
+}
+
+enum ResultFlag {
+  NORMAL
+  LOW
+  HIGH
+  CRITICAL_LOW
+  CRITICAL_HIGH
+}
+
+enum BarcodePosition {
+  TOP_LEFT
+  TOP_RIGHT
+  BOTTOM_LEFT
+  BOTTOM_RIGHT
+}
+
+/// Specimen container master (e.g. EDTA Tube, Plain Tube, Urine Container).
+/// Soft-deleted like Department/Category/SampleType.
+model Container {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name        String    @db.VarChar(100)
+  code        String?   @db.VarChar(20)
+  color       String?   @db.VarChar(7)
+  description String?
+  active      Boolean   @default(true)
+  deletedAt   DateTime? @map("deleted_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  sampleRules TestSampleRule[]
+  samples     Sample[]
+
+  @@map("containers")
+}
+
+/// 1:1 collection-rule extension of an existing catalogue Test — never
+/// touches the `tests` table itself. Drives which Container a Sample uses,
+/// fasting/STAT/temperature/volume requirements and the collection
+/// instructions shown on the Sample Order screen.
+model TestSampleRule {
+  id                         String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  testId                     String                 @unique @map("test_id") @db.Uuid
+  containerId                String?                @map("container_id") @db.Uuid
+  requiresFasting            Boolean                @default(false) @map("requires_fasting")
+  fastingHours               Int?                   @map("fasting_hours")
+  isStatAllowed              Boolean                @default(true) @map("is_stat_allowed")
+  temperatureRequirement     TemperatureRequirement @default(ROOM_TEMPERATURE) @map("temperature_requirement")
+  minVolumeMl                Decimal?               @map("min_volume_ml") @db.Decimal(6, 2)
+  volumeUnit                 String                 @default("mL") @map("volume_unit") @db.VarChar(10)
+  preparationInstructions    String?                @map("preparation_instructions")
+  collectionInstructions     String?                @map("collection_instructions")
+  postCollectionInstructions String?                @map("post_collection_instructions")
+  createdAt                  DateTime               @default(now()) @map("created_at")
+  updatedAt                  DateTime               @updatedAt @map("updated_at")
+
+  test      Test       @relation(fields: [testId], references: [id], onDelete: Cascade)
+  container Container? @relation(fields: [containerId], references: [id], onDelete: Restrict)
+
+  @@index([containerId])
+  @@map("test_sample_rules")
+}
+
+/// 1:1 extension of an existing SampleType — auto-generation barcode prefix/
+/// length. Never touches the `sample_types` table itself; every SampleType
+/// needs a row here before samples of that type can be collected (see
+/// `idGenerator.ts#nextSampleNo`).
+model SampleTypeBarcodeConfig {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sampleTypeId String   @unique @map("sample_type_id") @db.Uuid
+  prefix       String   @db.VarChar(10)
+  numberLength Int      @default(6) @map("number_length")
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  sampleType SampleType @relation(fields: [sampleTypeId], references: [id], onDelete: Restrict)
+
+  @@map("sample_type_barcode_configs")
+}
+
+/// 1:1 Report-side defaults for an existing catalogue Test (unit/method/
+/// critical values) — separate from TestSampleRule since it's owned/edited
+/// from Report Settings, not Sample Collection masters.
+model TestResultConfig {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  testId           String   @unique @map("test_id") @db.Uuid
+  unit             String?  @db.VarChar(30)
+  method           String?  @db.VarChar(100)
+  criticalLow      Decimal? @map("critical_low") @db.Decimal(10, 2)
+  criticalHigh     Decimal? @map("critical_high") @db.Decimal(10, 2)
+  decimalPrecision Int      @default(2) @map("decimal_precision")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  test Test @relation(fields: [testId], references: [id], onDelete: Cascade)
+
+  @@map("test_result_configs")
+}
+
+/// Join row attaching one reusable `Parameter` to one `Test`, in the order the
+/// report prints it (e.g. CBC -> Hemoglobin, RBC Count, MCV…). The analyte's
+/// identity (name/shortName/price) lives on `Parameter`; everything here is
+/// per-Test context, because the same analyte legitimately carries different
+/// units and reference ranges depending on the profile reporting it.
+///
+/// A Test with zero rows here keeps behaving exactly as before — Report Entry
+/// falls back to one free-text result line per test.
+///
+/// `formula` is an optional arithmetic expression referencing sibling
+/// parameters by their `Parameter.shortName` (e.g. "(PCV*10)/RBC"), evaluated
+/// by report.service.ts on save when Auto Calculation is on. It is intentionally
+/// retained through the catalogue rebuild: the admin UI doesn't expose it yet,
+/// but every read/write path keeps carrying it so auto-calculated parameters can
+/// be turned on in a later increment without another migration.
+model TestParameter {
+  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  testId             String   @map("test_id") @db.Uuid
+  parameterId        String   @map("parameter_id") @db.Uuid
+  sortOrder          Int      @default(0) @map("sort_order")
+  formula            String?
+  unit               String?  @db.VarChar(30)
+  referenceRangeText String?  @map("reference_range_text")
+  referenceRangeLow  Decimal? @map("reference_range_low") @db.Decimal(12, 4)
+  referenceRangeHigh Decimal? @map("reference_range_high") @db.Decimal(12, 4)
+  active             Boolean  @default(true)
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  test             Test                    @relation(fields: [testId], references: [id], onDelete: Cascade)
+  parameter        Parameter               @relation(fields: [parameterId], references: [id], onDelete: Restrict)
+  parameterResults ReportParameterResult[]
+
+  @@unique([testId, parameterId])
+  @@index([testId])
+  @@index([parameterId])
+  @@map("test_parameters")
+}
+
+/// One physical specimen collected for an Appointment. Tests that share a
+/// SampleType share one Sample row (enforced by the unique
+/// (appointmentId, sampleTypeId) below); different SampleTypes always get
+/// different Sample rows. `containerId` is snapshotted from TestSampleRule at
+/// creation time so a later rule edit never rewrites collection history.
+model Sample {
+  id                String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sampleNo          String       @unique @map("sample_no") @db.VarChar(30)
+  appointmentId     String       @map("appointment_id") @db.Uuid
+  sampleTypeId      String       @map("sample_type_id") @db.Uuid
+  containerId       String?      @map("container_id") @db.Uuid
+  status            SampleStatus @default(PENDING)
+  isEmergency       Boolean      @default(false) @map("is_emergency")
+  collectedAt       DateTime?    @map("collected_at")
+  collectedByUserId String?      @map("collected_by_user_id") @db.Uuid
+  receivedAt        DateTime?    @map("received_at")
+  receivedByUserId  String?      @map("received_by_user_id") @db.Uuid
+  approvedAt        DateTime?    @map("approved_at")
+  approvedByUserId  String?      @map("approved_by_user_id") @db.Uuid
+  rejectedAt        DateTime?    @map("rejected_at")
+  rejectedByUserId  String?      @map("rejected_by_user_id") @db.Uuid
+  rejectionReason   String?      @map("rejection_reason")
+  createdAt         DateTime     @default(now()) @map("created_at")
+  updatedAt         DateTime     @updatedAt @map("updated_at")
+
+  appointment       Appointment        @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  sampleType        SampleType         @relation(fields: [sampleTypeId], references: [id], onDelete: Restrict)
+  container         Container?         @relation(fields: [containerId], references: [id], onDelete: Restrict)
+  tests             SampleTest[]
+  statusLogs        SampleStatusLog[]
+  reportTestResults ReportTestResult[]
+
+  @@unique([appointmentId, sampleTypeId])
+  @@index([appointmentId])
+  @@index([sampleTypeId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("samples")
+}
+
+/// Join table: which ordered AppointmentTest rows a Sample covers. One
+/// AppointmentTest belongs to exactly one Sample (unique appointmentTestId).
+model SampleTest {
+  id                String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sampleId          String @map("sample_id") @db.Uuid
+  appointmentTestId String @unique @map("appointment_test_id") @db.Uuid
+  testId            String @map("test_id") @db.Uuid
+
+  sample          Sample          @relation(fields: [sampleId], references: [id], onDelete: Cascade)
+  appointmentTest AppointmentTest @relation(fields: [appointmentTestId], references: [id], onDelete: Cascade)
+  test            Test            @relation(fields: [testId], references: [id], onDelete: Restrict)
+
+  @@index([sampleId])
+  @@index([testId])
+  @@map("sample_tests")
+}
+
+/// Append-only audit trail of Sample status transitions — same shape as the
+/// existing LoginHistory/InvoiceSendLog logs. Powers the per-sample History.
+model SampleStatusLog {
+  id                String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sampleId          String        @map("sample_id") @db.Uuid
+  fromStatus        SampleStatus? @map("from_status")
+  toStatus          SampleStatus  @map("to_status")
+  performedByUserId String?       @map("performed_by_user_id") @db.Uuid
+  note              String?
+  createdAt         DateTime      @default(now()) @map("created_at")
+
+  sample Sample @relation(fields: [sampleId], references: [id], onDelete: Cascade)
+
+  @@index([sampleId])
+  @@map("sample_status_logs")
+}
+
+/// One Report per Appointment — created alongside its Samples (see
+/// `sample.service.ts#ensureSamplesForAppointment`) with every
+/// ReportTestResult row pre-scaffolded so Report Entry only ever reads.
+model Report {
+  id               String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  reportNo         String       @unique @map("report_no") @db.VarChar(30)
+  appointmentId    String       @unique @map("appointment_id") @db.Uuid
+  status           ReportStatus @default(PENDING)
+  isEmergency      Boolean      @default(false) @map("is_emergency")
+  enteredByUserId  String?      @map("entered_by_user_id") @db.Uuid
+  enteredAt        DateTime?    @map("entered_at")
+  approvedByUserId String?      @map("approved_by_user_id") @db.Uuid
+  approvedAt       DateTime?    @map("approved_at")
+  submittedAt      DateTime?    @map("submitted_at")
+  printCount       Int          @default(0) @map("print_count")
+  lastPrintedAt    DateTime?    @map("last_printed_at")
+  cancelReason     String?      @map("cancel_reason")
+  createdAt        DateTime     @default(now()) @map("created_at")
+  updatedAt        DateTime     @updatedAt @map("updated_at")
+
+  appointment Appointment        @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  results     ReportTestResult[]
+  auditLogs   ReportAuditLog[]
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([isEmergency])
+  @@map("reports")
+}
+
+/// One row per ordered AppointmentTest within a Report — pre-created empty
+/// alongside the Report so "load tests" is a read, never a materialize step.
+/// `referenceRange`/`unit`/`method` are snapshotted from Test/TestResultConfig
+/// at first load but stay editable per result.
+model ReportTestResult {
+  id                String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  reportId          String           @map("report_id") @db.Uuid
+  appointmentTestId String           @unique @map("appointment_test_id") @db.Uuid
+  testId            String           @map("test_id") @db.Uuid
+  sampleId          String?          @map("sample_id") @db.Uuid
+  resultValue       String?          @map("result_value")
+  unit              String?          @db.VarChar(30)
+  referenceRange    String?          @map("reference_range")
+  method            String?          @db.VarChar(100)
+  remarks           String?
+  flag              ResultFlag       @default(NORMAL)
+  isCritical        Boolean          @default(false) @map("is_critical")
+  enteredByUserId   String?          @map("entered_by_user_id") @db.Uuid
+  enteredAt         DateTime?        @map("entered_at")
+  // Per-test workflow (independent of sibling tests on the same bill) — see
+  // the `TestReportStatus` doc-comment.
+  status            TestReportStatus @default(PENDING)
+  submittedAt       DateTime?        @map("submitted_at")
+  approvedByUserId  String?          @map("approved_by_user_id") @db.Uuid
+  approvedAt        DateTime?        @map("approved_at")
+  rejectedAt        DateTime?        @map("rejected_at")
+  rejectReason      String?          @map("reject_reason")
+  printedAt         DateTime?        @map("printed_at")
+  createdAt         DateTime         @default(now()) @map("created_at")
+  updatedAt         DateTime         @updatedAt @map("updated_at")
+
+  report           Report                      @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  appointmentTest  AppointmentTest             @relation(fields: [appointmentTestId], references: [id], onDelete: Restrict)
+  test             Test                        @relation(fields: [testId], references: [id], onDelete: Restrict)
+  sample           Sample?                     @relation(fields: [sampleId], references: [id], onDelete: SetNull)
+  parameterResults ReportParameterResult[]
+  signatories      ReportTestResultSignatory[]
+
+  @@index([reportId])
+  @@index([sampleId])
+  @@index([status])
+  @@map("report_test_results")
+}
+
+/// One row per (ReportTestResult x TestParameter) — pre-scaffolded from the
+/// Test's TestParameter rows the same way ReportTestResult itself is
+/// pre-scaffolded from AppointmentTest (see `Report`'s doc-comment). A Test
+/// with no TestParameter rows never gets any of these — Report Entry falls
+/// back to the single free-text `ReportTestResult.resultValue` line.
+model ReportParameterResult {
+  id                 String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  reportTestResultId String     @map("report_test_result_id") @db.Uuid
+  testParameterId    String     @map("test_parameter_id") @db.Uuid
+  resultValue        String?    @map("result_value")
+  machineValue       String?    @map("machine_value")
+  flag               ResultFlag @default(NORMAL)
+  highlight          Boolean    @default(false)
+  createdAt          DateTime   @default(now()) @map("created_at")
+  updatedAt          DateTime   @updatedAt @map("updated_at")
+
+  reportTestResult ReportTestResult @relation(fields: [reportTestResultId], references: [id], onDelete: Cascade)
+  testParameter    TestParameter    @relation(fields: [testParameterId], references: [id], onDelete: Restrict)
+
+  @@unique([reportTestResultId, testParameterId])
+  @@index([reportTestResultId])
+  @@map("report_parameter_results")
+}
+
+/// Append-only audit trail of Report workflow actions — same shape as
+/// SampleStatusLog/LoginHistory.
+model ReportAuditLog {
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  reportId          String   @map("report_id") @db.Uuid
+  action            String   @db.VarChar(30)
+  performedByUserId String?  @map("performed_by_user_id") @db.Uuid
+  note              String?
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  report Report @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  @@index([reportId])
+  @@map("report_audit_logs")
+}
+
+/// A named report signatory (e.g. "Dr. Amankumar Kalaria", "Prime Diagnostic
+/// Center") — independent of `User`/login accounts, since a signatory is
+/// often a lab/clinic name rather than a person with an account. Selected
+/// per-test-result via `ReportTestResultSignatory` when approving.
+model Signatory {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name          String   @db.VarChar(150)
+  title         String?  @db.VarChar(150)
+  signaturePath String?  @map("signature_path")
+  passkeyHash   String?  @map("passkey_hash")
+  active        Boolean  @default(true)
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  reportTestResults ReportTestResultSignatory[]
+
+  @@map("signatories")
+}
+
+/// Join table: which Signatory(s) signed off a given ReportTestResult at
+/// approval time.
+model ReportTestResultSignatory {
+  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  reportTestResultId String   @map("report_test_result_id") @db.Uuid
+  signatoryId        String   @map("signatory_id") @db.Uuid
+  createdAt          DateTime @default(now()) @map("created_at")
+
+  reportTestResult ReportTestResult @relation(fields: [reportTestResultId], references: [id], onDelete: Cascade)
+  signatory        Signatory        @relation(fields: [signatoryId], references: [id], onDelete: Restrict)
+
+  @@unique([reportTestResultId, signatoryId])
+  @@index([reportTestResultId])
+  @@index([signatoryId])
+  @@map("report_test_result_signatories")
+}
+
+enum WatermarkMode {
+  NONE
+  TEXT
+  IMAGE
+}
+
+// ---------------------------------------------------------------------------
+// B2B / Organization Management module
+// ---------------------------------------------------------------------------
+
+enum OrganizationType {
+  GENERAL_CENTER
+  COLLECTION_CENTER
+}
+
+/// How a franchise is branded on its outward-facing documents. Deliberately
+/// separate from `OrganizationType` above: that one says what the center DOES
+/// (referral-only vs. sample-collecting), this one says WHOSE name appears on
+/// the report and invoice. A Collection Center can be either.
+///
+/// SINGLE_LAB (the default) renders the global `ReportSettings` branding —
+/// i.e. Example Diagnostics Lab's. CO_LAB renders the franchise's own `labName`/`labLogoPath`
+/// instead, falling back to the global settings for anything it leaves unset.
+enum FranchiseType {
+  SINGLE_LAB
+  CO_LAB
+}
+
+enum OrgPaymentType {
+  PREPAID
+  POSTPAID
+}
+
+/// Custom test pricing offered to one or more B2B Organizations, layered over
+/// the catalogue `Test.price`. Soft-deleted like Department/Category so
+/// historical Organizations referencing a retired price list keep resolving.
+/// Either an admin-authored TEMPLATE (`ownerOrganizationId` NULL) or a private
+/// CLONE owned by exactly one franchise. Assigning a template to a franchise
+/// never links the template itself — it mints a clone and points the
+/// Organization at that (see `assignPriceListToOrganization`), so one
+/// franchise's price edit can never move another franchise's prices.
+///
+/// The unique constraint on `ownerOrganizationId` makes "two franchises sharing
+/// one list" unrepresentable rather than merely discouraged; Postgres allows
+/// multiple NULLs, so templates are unconstrained.
+model PriceList {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name        String    @db.VarChar(150)
+  description String?
+  active      Boolean   @default(true)
+  deletedAt   DateTime? @map("deleted_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  /// NULL = admin template: assignable, and the only kind offered in the
+  /// "Initial Price List" dropdown. Non-NULL = a franchise's private clone,
+  /// editable by that franchise and never offered for assignment.
+  ownerOrganizationId String? @unique @map("owner_organization_id") @db.Uuid
+  /// Provenance of a clone — the template it was minted from. NULL on templates
+  /// themselves, and on clones whose template was later deleted.
+  templateId          String? @map("template_id") @db.Uuid
+
+  items                    PriceListItem[]
+  organizations            Organization[]
+  referralSources          ReferralSource[]
+  referralPriceAssignments ReferralPriceAssignment[]
+
+  ownerOrganization Organization? @relation("OwnedPriceList", fields: [ownerOrganizationId], references: [id], onDelete: Cascade)
+  template          PriceList?    @relation("PriceListTemplate", fields: [templateId], references: [id], onDelete: SetNull)
+  clones            PriceList[]   @relation("PriceListTemplate")
+
+  @@index([templateId])
+  @@map("price_lists")
+}
+
+enum PriceListItemType {
+  TEST
+  PACKAGE
+  PARAMETER
+}
+
+/// Per-catalogue-item price override within a PriceList — only items the lab
+/// actually wants to override get a row here; anything absent falls back to the
+/// catalogue's own price at resolution time (see `pricing.service.ts`).
+///
+/// `itemId` is a polymorphic reference (into `tests`, `packages` or `parameters`
+/// depending on `itemType`) rather than three nullable FK columns — same
+/// convention as `CartItem` and `AppOrderItem`. The trade-off is that catalogue
+/// deletes are guarded in the repositories rather than by an FK; those guards
+/// were already explicit `count()` checks, so nothing weakens here.
+model PriceListItem {
+  id          String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  priceListId String            @map("price_list_id") @db.Uuid
+  itemType    PriceListItemType @map("item_type")
+  itemId      String            @map("item_id") @db.Uuid
+  price       Decimal           @db.Decimal(10, 2)
+  /// Whether this item is offered at all under this price list — distinct
+  /// from `price`, which only overrides the sell price. Default `true` so
+  /// "no row for this item" and "a row with isOffered:true" mean the exact
+  /// same thing: offered, at whatever price applies. Only an explicit
+  /// `isOffered:false` row removes an item from a city's catalogue (see
+  /// `pricing.service.ts#resolveCityPriceListId` and `catalog.service.ts`).
+  isOffered   Boolean           @default(true) @map("is_offered")
+  createdAt   DateTime          @default(now()) @map("created_at")
+  updatedAt   DateTime          @updatedAt @map("updated_at")
+
+  priceList PriceList @relation(fields: [priceListId], references: [id], onDelete: Cascade)
+
+  @@unique([priceListId, itemType, itemId])
+  @@index([priceListId, itemType])
+  @@index([itemId])
+  @@map("price_list_items")
+}
+
+/// A B2B partner — a General Center (referral-only, billed relationship, no
+/// portal login) or a Collection Center (gets its own scoped portal login to
+/// register patients, collect samples, and view its own reports/invoices).
+/// `code` is minted from `organization_code_seq` the same way `Patient.patientId`
+/// is, for a stable human-readable, barcode-friendly identifier.
+model Organization {
+  id            String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code          String           @unique @db.VarChar(20)
+  name          String           @db.VarChar(150)
+  type          OrganizationType
+  /// Doubles as the franchise's "Owner Name" in the Superadmin franchise form —
+  /// same semantic, so it is reused rather than duplicated into a second column.
+  contactPerson String?          @map("contact_person") @db.VarChar(150)
+  mobile        String           @db.VarChar(15)
+  email         String?          @db.VarChar(255)
+  country       String?          @db.VarChar(100)
+  state         String?          @db.VarChar(100)
+  /// Denormalised city NAME. Still the column LIMS lists and filters on, so it
+  /// is kept and written alongside `cityId` whenever the Superadmin form picks
+  /// a city from the dropdown.
+  city          String?          @db.VarChar(100)
+  /// The picked `City` row, when the franchise was created from Superadmin
+  /// (which offers a dropdown rather than free text). Nullable because every
+  /// pre-existing Organization has only the free-text `city` above.
+  cityId        String?          @map("city_id") @db.Uuid
+  pincode       String?          @db.VarChar(10)
+  address       String?
+  description   String?
+
+  // Franchise identity & branding
+  franchiseType FranchiseType @default(SINGLE_LAB) @map("franchise_type")
+  /// Co-Lab branding overrides, both NULL for a SINGLE_LAB franchise. When set,
+  /// they are overlaid onto the global `ReportSettings` at report/invoice render
+  /// time — see `pricing`/`branding` resolution in franchise.service.ts.
+  labName       String?       @map("lab_name") @db.VarChar(150)
+  labLogoPath   String?       @map("lab_logo_path")
+
+  // Financial & Billing
+  priceListId            String?        @map("price_list_id") @db.Uuid
+  paymentType            OrgPaymentType @default(PREPAID) @map("payment_type")
+  creditLimit            Decimal        @default(0) @map("credit_limit") @db.Decimal(12, 2)
+  advanceAmount          Decimal        @default(0) @map("advance_amount") @db.Decimal(12, 2)
+  dueDays                Int            @default(0) @map("due_days")
+  source                 String?        @db.VarChar(150)
+  billingRules           String?        @map("billing_rules")
+  invoiceRules           String?        @map("invoice_rules")
+  /// Sparse array of "WHATSAPP"|"EMAIL"|"SMS" — same precedent as
+  /// ReportSettings.patientFields for a small, evolvable set of flags.
+  reportDeliveryChannels Json           @default("[]") @map("report_delivery_channels")
+  billDeliveryChannels   Json           @default("[]") @map("bill_delivery_channels")
+
+  // Access & Permissions
+  loginEnabled   Boolean @default(false) @map("login_enabled")
+  /// Sparse array of module keys: "patients" | "samples" | "reports" | "invoices".
+  enabledModules Json    @default("[]") @map("enabled_modules")
+
+  /// Referral commission rate paid to this organization — a manually-set
+  /// business policy, not derived from any billing calculation.
+  commissionPct   Decimal   @default(0) @map("commission_pct") @db.Decimal(5, 2)
+  active          Boolean   @default(true)
+  deletedAt       DateTime? @map("deleted_at")
+  createdByUserId String?   @map("created_by_user_id") @db.Uuid
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  priceList            PriceList?                 @relation(fields: [priceListId], references: [id], onDelete: SetNull)
+  cityRef              City?                      @relation(fields: [cityId], references: [id], onDelete: SetNull)
+  users                User[]
+  patients             Patient[]
+  auditLogs            OrganizationAuditLog[]
+  referralSources      ReferralSource[]
+  /// The private price-list clone this franchise owns. Distinct from
+  /// `priceList` above, which is the list currently IN USE — normally the same
+  /// row, but they differ for the instant between minting a replacement clone
+  /// and repointing `priceListId` at it.
+  ownedPriceList       PriceList?                 @relation("OwnedPriceList")
+  appOrders            AppOrder[]
+  /// Areas this franchise is assigned to cover — see `OrganizationServiceArea`.
+  /// Distinct from `cityId` above: a franchise can be scoped to specific
+  /// areas within its city (or across cities), not just "the whole city."
+  serviceAreas         OrganizationServiceArea[]
+  /// Set when this franchise is the "parent" for a `City` — see
+  /// `City.parentOrganizationId`. Null for every other franchise.
+  parentOfCity         City?                      @relation("CityParentFranchise")
+  /// "Nearest Lab" cards (`ServiceCenter`) assigned to this franchise — see
+  /// `ServiceCenter.organizationId`.
+  serviceCenters       ServiceCenter[]
+  /// Phlebotomists this franchise created from its own portal — see
+  /// `Phlebotomist.createdByOrganizationId`.
+  createdPhlebotomists Phlebotomist[]
+  /// New-area requests this franchise submitted from its own portal — see
+  /// `AreaApprovalRequest`.
+  areaRequests         AreaApprovalRequest[]
+  /// This franchise's in-app notification feed — see
+  /// `OrganizationNotification`.
+  notifications        OrganizationNotification[]
+
+  @@index([type])
+  @@index([active])
+  @@index([name])
+  @@index([franchiseType])
+  @@index([cityId])
+  @@map("organizations")
+}
+
+/// Which Area(s) a franchise is assigned to cover — mirrors
+/// `PhlebotomistServiceArea` exactly, same reason: an order's franchise-visibility
+/// is not "this franchise's city" but "this franchise's assigned areas," and a
+/// franchise can plausibly cover more than one. `AppOrder.organizationId` is a
+/// booking-time snapshot (set only when a franchise places the order directly);
+/// this table is what lets a patient-web/app order — which never stamps
+/// `organizationId` — still resolve to the franchise covering the order's
+/// `areaId`. See `franchiseOrderScope` in `backend/src/services/franchiseOrderScope.ts`.
+model OrganizationServiceArea {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  areaId         String   @map("area_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  area         Area         @relation(fields: [areaId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, areaId])
+  @@index([areaId])
+  @@index([organizationId])
+  @@map("organization_service_areas")
+}
+
+/// Append-only audit trail of Organization changes — same shape as
+/// ReportAuditLog/SampleStatusLog.
+model OrganizationAuditLog {
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId    String   @map("organization_id") @db.Uuid
+  action            String   @db.VarChar(30)
+  performedByUserId String?  @map("performed_by_user_id") @db.Uuid
+  note              String?
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@map("organization_audit_logs")
+}
+
+/// A field marketing employee who owns a set of ReferralDoctor
+/// relationships and is measured against monthly revenue/doctor/patient
+/// targets. Soft-deleted like Department/Organization so historical
+/// DoctorVisit/MonthlyTarget/commission records for a departed staff member
+/// keep resolving correctly.
+model MarketingStaff {
+  id           String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  employeeCode String    @unique @map("employee_code") @db.VarChar(30)
+  name         String    @db.VarChar(150)
+  mobile       String    @db.VarChar(15)
+  email        String?   @db.VarChar(255)
+  designation  String?   @db.VarChar(100)
+  /// No Branch model exists yet — reserved, non-FK column for future use.
+  branchId     String?   @map("branch_id") @db.VarChar(50)
+  joiningDate  DateTime  @map("joining_date") @db.Date
+  status       Boolean   @default(true)
+  deletedAt    DateTime? @map("deleted_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  referralDoctors ReferralDoctor[]
+  visits          DoctorVisit[]
+  monthlyTargets  MonthlyTarget[]
+  auditLogs       MarketingStaffAuditLog[]
+  /// Referral Management module (fully separate from ReferralDoctor above) —
+  /// a referral source can optionally be owned by a marketing staff member.
+  referralSources ReferralSource[]
+
+  @@index([status])
+  @@index([name])
+  @@map("marketing_staff")
+}
+
+/// Append-only audit trail of MarketingStaff changes — same shape as
+/// OrganizationAuditLog/ReportAuditLog.
+model MarketingStaffAuditLog {
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  marketingStaffId  String   @map("marketing_staff_id") @db.Uuid
+  action            String   @db.VarChar(30)
+  performedByUserId String?  @map("performed_by_user_id") @db.Uuid
+  note              String?
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  marketingStaff MarketingStaff @relation(fields: [marketingStaffId], references: [id], onDelete: Cascade)
+
+  @@index([marketingStaffId])
+  @@map("marketing_staff_audit_logs")
+}
+
+/// A referring doctor, optionally assigned to one MarketingStaff for
+/// visit/relationship ownership. Soft-deleted like MarketingStaff. Linked
+/// from `Patient.referralDoctorId` for revenue attribution.
+model ReferralDoctor {
+  id               String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  doctorName       String    @map("doctor_name") @db.VarChar(150)
+  hospitalName     String?   @map("hospital_name") @db.VarChar(150)
+  speciality       String?   @db.VarChar(100)
+  mobile           String?   @db.VarChar(15)
+  email            String?   @db.VarChar(255)
+  city             String?   @db.VarChar(100)
+  address          String?
+  remarks          String?
+  marketingStaffId String?   @map("marketing_staff_id") @db.Uuid
+  status           Boolean   @default(true)
+  deletedAt        DateTime? @map("deleted_at")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  marketingStaff MarketingStaff?          @relation(fields: [marketingStaffId], references: [id], onDelete: SetNull)
+  visits         DoctorVisit[]
+  patients       Patient[]
+  auditLogs      ReferralDoctorAuditLog[]
+
+  @@index([marketingStaffId])
+  @@index([doctorName])
+  @@index([status])
+  @@map("referral_doctors")
+}
+
+/// Append-only audit trail of ReferralDoctor changes (create/update/delete/
+/// restore/status/assign/transfer/bulk-assign).
+model ReferralDoctorAuditLog {
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  referralDoctorId  String   @map("referral_doctor_id") @db.Uuid
+  action            String   @db.VarChar(30)
+  performedByUserId String?  @map("performed_by_user_id") @db.Uuid
+  note              String?
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  referralDoctor ReferralDoctor @relation(fields: [referralDoctorId], references: [id], onDelete: Cascade)
+
+  @@index([referralDoctorId])
+  @@map("referral_doctor_audit_logs")
+}
+
+/// Append-only visit log — no update/delete, matches SampleStatusLog's
+/// shape. Powers Visit History + Upcoming Visits.
+model DoctorVisit {
+  id               String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  marketingStaffId String    @map("marketing_staff_id") @db.Uuid
+  referralDoctorId String    @map("referral_doctor_id") @db.Uuid
+  visitDate        DateTime  @map("visit_date") @db.Date
+  nextVisitDate    DateTime? @map("next_visit_date") @db.Date
+  remarks          String?
+  createdAt        DateTime  @default(now()) @map("created_at")
+
+  marketingStaff MarketingStaff @relation(fields: [marketingStaffId], references: [id], onDelete: Cascade)
+  referralDoctor ReferralDoctor @relation(fields: [referralDoctorId], references: [id], onDelete: Cascade)
+
+  @@index([marketingStaffId])
+  @@index([referralDoctorId])
+  @@index([nextVisitDate])
+  @@map("doctor_visits")
+}
+
+/// One row per staff per month — upserted via the `[marketingStaffId,
+/// month, year]` unique constraint, never duplicated by re-saving a month.
+model MonthlyTarget {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  marketingStaffId String   @map("marketing_staff_id") @db.Uuid
+  month            Int      @db.SmallInt
+  year             Int      @db.SmallInt
+  revenueTarget    Decimal  @map("revenue_target") @db.Decimal(12, 2)
+  doctorTarget     Int      @map("doctor_target")
+  patientTarget    Int      @map("patient_target")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  marketingStaff MarketingStaff @relation(fields: [marketingStaffId], references: [id], onDelete: Cascade)
+
+  @@unique([marketingStaffId, month, year])
+  @@index([month, year])
+  @@map("monthly_targets")
+}
+
+/// Commission percentage bands applied to a staff's achieved monthly
+/// revenue (see `commissionSlab.service.ts#calculateCommission`).
+/// `toAmount` nullable = open-ended top band (e.g. "500000 and above").
+model CommissionSlab {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  fromAmount Decimal  @map("from_amount") @db.Decimal(12, 2)
+  toAmount   Decimal? @map("to_amount") @db.Decimal(12, 2)
+  percentage Decimal  @db.Decimal(5, 2)
+  active     Boolean  @default(true)
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@map("commission_slabs")
+}
+
+/// Singleton row (same fixed-id pattern as ReportSettings) holding the
+/// Razorpay credentials editable from Superadmin Settings > Payment Gateway.
+/// Deliberately its own table rather than a field on `AppConfig` — AppConfig
+/// is returned wholesale by the public `GET /api/v1/app/config` endpoint, and
+/// `razorpayKeySecret` must never be reachable from that response.
+/// `razorpay.service.ts#resolveCredentials` reads this first, falling back to
+/// the RAZORPAY_KEY_ID/RAZORPAY_KEY_SECRET env vars only if the row is empty.
+model PaymentGatewayConfig {
+  id                String   @id @default("default") @db.VarChar(20)
+  razorpayKeyId     String?  @map("razorpay_key_id")
+  razorpayKeySecret String?  @map("razorpay_key_secret")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  @@map("payment_gateway_config")
+}
+
+/// Singleton row (fixed id) holding the Report PDF's letterhead/branding/
+/// layout/field-visibility settings — GET auto-creates the default row if
+/// missing, no seed needed. Rendered by `reportPdf.service.ts#renderReportPdf`
+/// for both real reports and the Report Designer's live preview.
+model ReportSettings {
+  id           String  @id @default("default") @db.VarChar(20)
+  labName      String? @map("lab_name") @db.VarChar(150)
+  primaryColor String  @default("#0B1E39") @map("primary_color") @db.VarChar(7)
+
+  headerText      String? @map("header_text")
+  headerImagePath String? @map("header_image_path")
+  footerText      String? @map("footer_text")
+  footerImagePath String? @map("footer_image_path")
+  showFooter      Boolean @default(true) @map("show_footer")
+
+  logoPath String? @map("logo_path")
+
+  watermarkMode      WatermarkMode @default(NONE) @map("watermark_mode")
+  watermarkText      String?       @map("watermark_text") @db.VarChar(100)
+  watermarkImagePath String?       @map("watermark_image_path")
+
+  signaturePath         String? @map("signature_path")
+  showSignature         Boolean @default(true) @map("show_signature")
+  minSignaturesRequired Int     @default(1) @map("min_signatures_required")
+
+  showBarcode     Boolean         @default(true) @map("show_barcode")
+  showQrCode      Boolean         @default(true) @map("show_qr_code")
+  barcodePosition BarcodePosition @default(TOP_RIGHT) @map("barcode_position")
+  showPageNumber  Boolean         @default(true) @map("show_page_number")
+
+  marginTop    Int    @default(40) @map("margin_top")
+  marginRight  Int    @default(40) @map("margin_right")
+  marginBottom Int    @default(40) @map("margin_bottom")
+  marginLeft   Int    @default(40) @map("margin_left")
+  lineSpacing  Float  @default(1.0) @map("line_spacing")
+  fontSize     Int    @default(9) @map("font_size")
+  pageSize     String @default("A4") @map("page_size") @db.VarChar(10)
+
+  /// Sparse maps merged over `REPORT_SETTINGS_DEFAULTS` (backend types) at
+  /// read time — see `reportSettings.repository.ts#toReportSettingsDto`.
+  patientFields Json @default("{}") @map("patient_fields")
+  reportFields  Json @default("{}") @map("report_fields")
+
+  updatedByUserId String?  @map("updated_by_user_id") @db.Uuid
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@map("report_settings")
+}
+
+// ---------------------------------------------------------------------------
+// Referral Management module — a directory of referral sources (doctors,
+// hospitals, clinics, self-referrals, corporates), independent of the
+// Marketing Staff module's ReferralDoctor/CommissionSlab/MonthlyTarget. Every
+// billed patient with a referralSourceId set automatically produces a
+// ReferralIncentive row (see bill.repository.ts#createBillForAppointment),
+// which is later batched into a ReferralSettlement for payout.
+// ---------------------------------------------------------------------------
+
+enum ReferralType {
+  DOCTOR
+  HOSPITAL
+  CLINIC
+  SELF
+  CORPORATE
+  OTHER
+}
+
+enum SettlementStatus {
+  PENDING
+  PAID
+  CANCELLED
+}
+
+enum IncentiveStatus {
+  PENDING
+  SETTLED
+  CANCELLED
+}
+
+model ReferralSource {
+  id           String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  referralCode String       @unique @map("referral_code") @db.VarChar(20)
+  referralType ReferralType @map("referral_type")
+  name         String       @db.VarChar(150)
+
+  organizationId String? @map("organization_id") @db.Uuid
+  mobile         String  @db.VarChar(15)
+  email          String? @db.VarChar(255)
+  speciality     String? @db.VarChar(100)
+  address        String?
+  city           String? @db.VarChar(100)
+
+  marketingStaffId    String? @map("marketing_staff_id") @db.Uuid
+  assignedPriceListId String? @map("assigned_price_list_id") @db.Uuid
+
+  /// Default commission rate applied automatically to every bill linked to
+  /// this source (see recordIncentiveForBillIfApplicable); editable per
+  /// settlement at generation time via ReferralSettlement.commissionPercentage.
+  commissionPercentage Decimal @default(0) @map("commission_percentage") @db.Decimal(5, 2)
+
+  status    Boolean   @default(true)
+  notes     String?
+  deletedAt DateTime? @map("deleted_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  organization      Organization?             @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+  marketingStaff    MarketingStaff?           @relation(fields: [marketingStaffId], references: [id], onDelete: SetNull)
+  assignedPriceList PriceList?                @relation(fields: [assignedPriceListId], references: [id], onDelete: SetNull)
+  priceAssignments  ReferralPriceAssignment[]
+  settlements       ReferralSettlement[]
+  incentives        ReferralIncentive[]
+  patients          Patient[]
+  auditLogs         ReferralSourceAuditLog[]
+
+  @@index([status])
+  @@index([name])
+  @@index([marketingStaffId])
+  @@index([assignedPriceListId])
+  @@map("referral_sources")
+}
+
+/// Append-only audit trail of ReferralSource changes — same shape as
+/// OrganizationAuditLog/MarketingStaffAuditLog.
+model ReferralSourceAuditLog {
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  referralSourceId  String   @map("referral_source_id") @db.Uuid
+  action            String   @db.VarChar(30)
+  performedByUserId String?  @map("performed_by_user_id") @db.Uuid
+  note              String?
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  referralSource ReferralSource @relation(fields: [referralSourceId], references: [id], onDelete: Cascade)
+
+  @@index([referralSourceId])
+  @@map("referral_source_audit_logs")
+}
+
+/// Append-only history of price-list assignment changes for a referral
+/// source. The current live assignment lives on
+/// ReferralSource.assignedPriceListId itself — this is the "who changed it
+/// and when" trail, one row per assign/change, not written on "remove".
+model ReferralPriceAssignment {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  referralSourceId String   @map("referral_source_id") @db.Uuid
+  priceListId      String   @map("price_list_id") @db.Uuid
+  assignedBy       String?  @map("assigned_by") @db.Uuid
+  assignedAt       DateTime @default(now()) @map("assigned_at")
+
+  referralSource ReferralSource @relation(fields: [referralSourceId], references: [id], onDelete: Cascade)
+  priceList      PriceList      @relation(fields: [priceListId], references: [id], onDelete: Restrict)
+
+  @@index([referralSourceId])
+  @@map("referral_price_assignments")
+}
+
+/// One row per generated settlement run — a date-range batch of a single
+/// referral source's PENDING incentives, aggregated into one payable amount.
+model ReferralSettlement {
+  id                   String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  referralSourceId     String           @map("referral_source_id") @db.Uuid
+  fromDate             DateTime         @map("from_date") @db.Date
+  toDate               DateTime         @map("to_date") @db.Date
+  totalPatients        Int              @map("total_patients")
+  totalRevenue         Decimal          @map("total_revenue") @db.Decimal(12, 2)
+  commissionPercentage Decimal          @map("commission_percentage") @db.Decimal(5, 2)
+  commissionAmount     Decimal          @map("commission_amount") @db.Decimal(12, 2)
+  adjustment           Decimal          @default(0) @db.Decimal(12, 2)
+  finalAmount          Decimal          @map("final_amount") @db.Decimal(12, 2)
+  settlementStatus     SettlementStatus @default(PENDING) @map("settlement_status")
+  paymentDate          DateTime?        @map("payment_date")
+  remarks              String?
+  createdAt            DateTime         @default(now()) @map("created_at")
+
+  referralSource ReferralSource      @relation(fields: [referralSourceId], references: [id], onDelete: Cascade)
+  incentives     ReferralIncentive[]
+
+  @@index([referralSourceId])
+  @@index([settlementStatus])
+  @@map("referral_settlements")
+}
+
+/// One row per bill for a patient with a referralSourceId set — created
+/// automatically inside the same transaction as the Bill. Rolled up into a
+/// ReferralSettlement (settlementId set, status -> SETTLED) by "Generate
+/// Settlement"; unrolled (settlementId cleared, status -> PENDING) if that
+/// settlement is cancelled, so it can be re-settled later.
+model ReferralIncentive {
+  id                   String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  referralSourceId     String          @map("referral_source_id") @db.Uuid
+  billId               String          @unique @map("bill_id") @db.Uuid
+  patientId            String          @map("patient_id") @db.Uuid
+  billAmount           Decimal         @map("bill_amount") @db.Decimal(10, 2)
+  commissionPercentage Decimal         @map("commission_percentage") @db.Decimal(5, 2)
+  incentiveAmount      Decimal         @map("incentive_amount") @db.Decimal(10, 2)
+  incentiveStatus      IncentiveStatus @default(PENDING) @map("incentive_status")
+  settlementId         String?         @map("settlement_id") @db.Uuid
+  createdAt            DateTime        @default(now()) @map("created_at")
+
+  referralSource ReferralSource      @relation(fields: [referralSourceId], references: [id], onDelete: Cascade)
+  bill           Bill                @relation(fields: [billId], references: [id], onDelete: Cascade)
+  patient        Patient             @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  settlement     ReferralSettlement? @relation(fields: [settlementId], references: [id], onDelete: SetNull)
+
+  @@index([referralSourceId])
+  @@index([incentiveStatus])
+  @@index([settlementId])
+  @@map("referral_incentives")
+}
+
+// ---------------------------------------------------------------------------
+// Finance module: Expense tracking (Finance > Expenses). The Finance Reports
+// screen itself has no dedicated tables — it reads Bill/Payment/Appointment
+// data already modelled above.
+// ---------------------------------------------------------------------------
+
+enum ExpenseEntryType {
+  DEBIT
+  CREDIT
+}
+
+/// Expense category master (e.g. "Utilities", "Maintenance") — same
+/// soft-deletable shape as Department.
+model ExpenseCategory {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String    @db.VarChar(100)
+  active    Boolean   @default(true)
+  deletedAt DateTime? @map("deleted_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  services ExpenseService[]
+  expenses Expense[]
+
+  @@map("expense_categories")
+}
+
+/// Expense service master (e.g. "Electricity Bill") scoped to one
+/// ExpenseCategory — same parent/child shape as Category under Department.
+model ExpenseService {
+  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  categoryId String    @map("category_id") @db.Uuid
+  name       String    @db.VarChar(150)
+  active     Boolean   @default(true)
+  deletedAt  DateTime? @map("deleted_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+
+  category ExpenseCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  expenses Expense[]
+
+  @@index([categoryId])
+  @@map("expense_services")
+}
+
+// ---------------------------------------------------------------------------
+// Patient App module — a new patient-facing REST API surface
+// (mounted under /api/v1/app) backed by this SAME database. Wherever the
+// admin/franchise side already models a concept (tests, packages, patients,
+// appointments, bills, payments, samples, reports) the app reads/writes
+// those exact tables above — see FamilyMember/AppOrder below. Only concepts
+// with no existing LIMS equivalent (OTP login, cart, addresses, wallet,
+// coupons, slots, service centers, prescriptions, support tickets, app
+// config) get new tables here.
+// ---------------------------------------------------------------------------
+
+enum OtpPurpose {
+  LOGIN
+  PHLEBO_LOGIN
+  THIRD_PARTY_LAB_LOGIN
+}
+
+/// Login OTPs for the Patient App only — entirely separate from the
+/// internal `User`/`Role` username+password login above.
+model OtpCode {
+  id           String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  mobile       String     @db.VarChar(15)
+  otpCode      String     @map("otp_code") @db.VarChar(6)
+  purpose      OtpPurpose @default(LOGIN)
+  isVerified   Boolean    @default(false) @map("is_verified")
+  attemptCount Int        @default(0) @map("attempt_count")
+  expiresAt    DateTime   @map("expires_at")
+  createdAt    DateTime   @default(now()) @map("created_at")
+
+  @@index([mobile, purpose])
+  @@map("app_otp_codes")
+}
+
+/// Bridges the ThirdPartyReport module's send-otp -> verify-otp round trip:
+/// holds the `UserFID` the third-party partner API returned for a
+/// mobile number so it can be retrieved once our own OTP is verified. Kept
+/// as its own table (rather than reusing OtpCode/AppUser) so the module
+/// stays fully isolated from the existing report/app-user schema.
+model ThirdPartyLabSession {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  mobile    String   @unique @db.VarChar(15)
+  userFid   String   @map("user_fid")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("app_third_party_lab_sessions")
+}
+
+model State {
+  id   String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name String  @db.VarChar(100)
+  code String? @db.VarChar(10)
+
+  cities City[]
+
+  @@map("app_states")
+}
+
+model City {
+  id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  stateId              String   @map("state_id") @db.Uuid
+  name                 String   @db.VarChar(100)
+  slug                 String   @unique @db.VarChar(120)
+  isActive             Boolean  @default(true) @map("is_active")
+  /// Curated "major city" flag for the Home page's "Book {test} Near You"
+  /// SEO link sections — deliberately separate from `isActive` (every active
+  /// city is bookable; only a curated subset is worth cross-linking from the
+  /// homepage, or that section would be an unreadable wall of 60+ links).
+  isFeatured           Boolean  @default(false) @map("is_featured")
+  /// Per-city cutover flag for the new Slot Template system (see SlotTemplate
+  /// below) — a city stays on the legacy `Slot`/`centerId:null` engine until
+  /// an admin flips this, after verifying its templates/areas/phlebotomists
+  /// are configured. Deliberately per-city, not global, so rollout can be
+  /// staged and instantly reverted per city.
+  useNewSlotSystem     Boolean  @default(false) @map("use_new_slot_system")
+  /// Default phlebotomy/sample-collection charge applied to Review Cart for
+  /// this city's orders under the new Slot Template system — an `Area` may
+  /// override it (see `Area.phlebotomyCharge`); admin-editable from the
+  /// Superadmin CMS "Phlebotomy Charges" tab.
+  phlebotomyCharge     Decimal  @default(100) @map("phlebotomy_charge") @db.Decimal(10, 2)
+  /// The one franchise (`Organization`) whose price list rules this city's
+  /// patient-app catalogue — which tests/packages/parameters appear and at
+  /// what price (see `PriceListItem.isOffered` and
+  /// `pricing.service.ts#resolveCityPriceListId`). A city may still have other
+  /// `Organization`s with `cityId` pointing at it (multiple franchises per
+  /// city is normal), but only this one drives what a patient browsing this
+  /// city actually sees; the rest just fulfil orders. NULL = no parent set
+  /// yet, and the app falls back to the full global catalogue at catalogue
+  /// prices — never an empty list. `@unique` because one franchise cannot be
+  /// the parent of two cities at once.
+  parentOrganizationId String?  @unique @map("parent_organization_id") @db.Uuid
+  /// City-center point (not a specific lab's address) — used only as a
+  /// fallback distance-sort origin for "Nearest Lab" when the device hasn't
+  /// granted geolocation, so a patient still sees this city's labs first and
+  /// the rest ordered nearest-first from the city itself. NULL = no fallback
+  /// sort is possible for this city; the list falls back to unsorted order.
+  latitude             Decimal? @db.Decimal(10, 7)
+  longitude            Decimal? @db.Decimal(10, 7)
+
+  state              State          @relation(fields: [stateId], references: [id], onDelete: Restrict)
+  appUsers           AppUser[]
+  prescriptions      Prescription[]
+  organizations      Organization[]
+  parentOrganization Organization?  @relation("CityParentFranchise", fields: [parentOrganizationId], references: [id], onDelete: SetNull)
+
+  areas             Area[]
+  citySlotTemplates CitySlotTemplate[]
+  slotBlocks        SlotBlock[]
+  holidays          Holiday[]
+  phlebotomists     Phlebotomist[]
+  areaRequests      AreaApprovalRequest[]
+  landingPages      LandingPage[]
+
+  @@index([stateId])
+  @@map("app_cities")
+}
+
+/// The Patient App's own login account (mobile + OTP) — deliberately
+/// separate from `User` (staff username+password login): a patient has no
+/// password, no `Role`, and signs in with a flow the admin side has no
+/// equivalent of. `dob`/`gender` live here (not duplicated per family
+/// member) because the account holder IS one of their own family members
+/// (see FamilyMember.isSelf).
+model AppUser {
+  id                      String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  mobile                  String       @unique @db.VarChar(15)
+  name                    String?      @db.VarChar(150)
+  email                   String?      @db.VarChar(255)
+  gender                  Gender?
+  dob                     DateTime?    @db.Date
+  profilePicUrl           String?      @map("profile_pic_url")
+  /// ID-proof-style upload from Complete/Edit Profile — plain file storage,
+  /// no admin review/approval workflow (unlike, say, a KYC status field).
+  verificationDocumentUrl String?      @map("verification_document_url")
+  cityId                  String?      @map("city_id") @db.Uuid
+  isProfileComplete       Boolean      @default(false) @map("is_profile_complete")
+  isActive                Boolean      @default(true) @map("is_active")
+  passwordHash            String?      @map("password_hash")
+  /// Most recent platform this account logged in from — refreshed on every
+  /// OTP verify, so it's "last used", not "registered from". Null for
+  /// pre-migration rows; the API layer displays those as WEB.
+  platform                AppPlatform?
+  /// Device push token for Firebase Cloud Messaging, captured (when the
+  /// client sends one) on every OTP verify — same "last used" semantics as
+  /// `platform` above. Single most-recently-seen device only (not one row
+  /// per device) — see `services/notification.service.ts#sendCustomNotification`
+  /// and `services/orderNotification.service.ts` for where this gets read.
+  fcmToken                String?      @map("fcm_token")
+  /// The app's Settings > Notification Setting on/off toggle. `false` means
+  /// every push to this account is suppressed at send time — the in-app
+  /// `Notification` list below is unaffected either way (that's history,
+  /// not delivery). See `services/app/notificationList.service.ts`.
+  pushEnabled             Boolean      @default(true) @map("push_enabled")
+  createdAt               DateTime     @default(now()) @map("created_at")
+  updatedAt               DateTime     @updatedAt @map("updated_at")
+
+  city City? @relation(fields: [cityId], references: [id], onDelete: SetNull)
+
+  familyMembers         FamilyMember[]
+  addresses             Address[]
+  cart                  Cart?
+  wallet                Wallet?
+  orders                AppOrder[]
+  payments              AppPayment[]
+  walletRecharges       WalletRecharge[]
+  prescriptions         Prescription[]
+  supportTickets        SupportTicket[]
+  notifications         Notification[]
+  whatsappConversations WhatsappConversation[]
+  followUpReminders     FollowUpReminder[]
+
+  @@index([cityId])
+  @@map("app_users")
+}
+
+/// The Patient App's in-app notification feed (Settings > Notifications) —
+/// distinct from the push itself: a push tells the OS to show a banner while
+/// the app is backgrounded/killed, this is the persistent list the app reads
+/// back via `GET /notifications` regardless of whether the push was ever
+/// delivered (missing token, push disabled, offline, etc.). One row is
+/// written for every patient-facing event `orderNotification.service.ts`
+/// fires, whether or not the push itself succeeds.
+enum AppNotificationType {
+  ORDER_UPDATE
+  REPORT_READY
+  PROMO
+  PRESCRIPTION_STATUS
+  APPOINTMENT_REMINDER
+  BOOKING_CANCELLED
+}
+
+model Notification {
+  id        String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  appUserId String              @map("app_user_id") @db.Uuid
+  type      AppNotificationType
+  title     String
+  message   String
+  /// Big-picture image for the push's rich layout — almost always null for
+  /// the transactional order/report events; reserved for promo-style pushes.
+  imageUrl  String?             @map("image_url")
+  /// Whatever this notification is "about" — an `AppOrder.id` today — so the
+  /// client can deep-link on tap. Deliberately untyped/unconstrained (no FK):
+  /// it's polymorphic by `type` the same way `CartItem`/`AppOrderItem` are.
+  targetId  String?             @map("target_id") @db.Uuid
+  isRead    Boolean             @default(false) @map("is_read")
+  createdAt DateTime            @default(now()) @map("created_at")
+  readAt    DateTime?           @map("read_at")
+
+  appUser AppUser @relation(fields: [appUserId], references: [id], onDelete: Cascade)
+
+  @@index([appUserId, createdAt])
+  @@map("app_notifications")
+}
+
+enum FamilyMemberRelation {
+  SELF
+  FATHER
+  MOTHER
+  SPOUSE
+  SON
+  DAUGHTER
+  BROTHER
+  SISTER
+  OTHER
+}
+
+/// The person a booking is actually for — including the account holder
+/// (`relation = SELF`, auto-created at profile completion). Deliberately
+/// holds NO name/mobile/dob/gender of its own: those live on the linked
+/// `Patient` row, the same one the admin/franchise portal sees, so there is
+/// exactly one place that data can drift.
+model FamilyMember {
+  id           String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  appUserId    String               @map("app_user_id") @db.Uuid
+  patientId    String               @unique @map("patient_id") @db.Uuid
+  relation     FamilyMemberRelation
+  uploadDocUrl String?              @map("upload_doc_url")
+  createdAt    DateTime             @default(now()) @map("created_at")
+  updatedAt    DateTime             @updatedAt @map("updated_at")
+
+  appUser AppUser @relation(fields: [appUserId], references: [id], onDelete: Cascade)
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: Restrict)
+
+  cartItems            CartItem[]
+  appOrderAppointments AppOrderAppointment[]
+  appOrderItems        AppOrderItem[]
+  homeVisitOrders      AppOrder[]
+  prescriptions        Prescription[]
+
+  @@index([appUserId])
+  @@map("app_family_members")
+}
+
+enum AddressType {
+  HOME
+  WORK
+  OTHER
+}
+
+model Address {
+  id        String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  appUserId String      @map("app_user_id") @db.Uuid
+  type      AddressType @default(HOME)
+  houseNo   String?     @map("house_no") @db.VarChar(100)
+  /// Building / block number within a society or complex ("Block C", "Tower
+  /// 4") — separate from `apartment` (the society/building *name*) because
+  /// the Add Address form now collects both, and a phlebotomist navigating a
+  /// gated complex needs the block to find the door at all.
+  blockNo   String?     @map("block_no") @db.VarChar(100)
+  apartment String?     @db.VarChar(150)
+  address   String
+  locality  String?     @db.VarChar(150)
+  landmark  String?     @db.VarChar(150)
+  city      String      @db.VarChar(100)
+  state     String      @db.VarChar(100)
+  pincode   String      @db.VarChar(6)
+  phone     String      @db.VarChar(15)
+  latitude  Decimal?    @db.Decimal(10, 7)
+  longitude Decimal?    @db.Decimal(10, 7)
+  isDefault Boolean     @default(false) @map("is_default")
+  /// Which Area (sub-division of a City) this address belongs to — set via
+  /// an Area picker in the Add/Edit Address flow going forward. Nullable:
+  /// legacy addresses (and any address saved before the app adds the
+  /// picker) have no area, and the new Slot Template engine treats that as
+  /// "service not available" for that address rather than guessing.
+  areaId    String?     @map("area_id") @db.Uuid
+  createdAt DateTime    @default(now()) @map("created_at")
+  updatedAt DateTime    @updatedAt @map("updated_at")
+
+  appUser AppUser    @relation(fields: [appUserId], references: [id], onDelete: Cascade)
+  area    Area?      @relation(fields: [areaId], references: [id], onDelete: SetNull)
+  orders  AppOrder[]
+
+  @@index([appUserId])
+  @@index([areaId])
+  @@map("app_addresses")
+}
+
+/// Home-screen carousel banner.
+model Banner {
+  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  imageUrl   String    @map("image_url")
+  sortOrder  Int       @default(0) @map("sort_order")
+  isActive   Boolean   @default(true) @map("is_active")
+  validFrom  DateTime? @map("valid_from")
+  validUntil DateTime? @map("valid_until")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+
+  @@map("app_banners")
+}
+
+/// A hero-carousel slide on the patient WEBSITE's home page — image, copy and
+/// (optionally) the Package it promotes, all admin-managed from Superadmin's
+/// CMS > Web Banner tab. Distinct from `Banner` (`app_banners`), which is the
+/// mobile app's image-only carousel and carries no copy of its own.
+///
+/// Crucially it stores NO price, MRP, discount or parameter count: those are
+/// read live off `package` at request time. The hardcoded slide this replaces
+/// advertised "₹1,899" while the very same package's card on the same page
+/// said ₹3,499 — a typed number is a number that drifts, and a promo banner
+/// quoting the wrong price is worse than no banner.
+/// Which of the two website mastheads a `WebBanner` belongs to. The Home
+/// page and a city landing page are different pages with different jobs, and
+/// before this they drew from one shared list — so whatever was promoted on
+/// Home appeared, word for word, on every city page too.
+///
+/// CITY is the default because every row that existed before this field was
+/// written for the city-style card: copy, a promoted package, a link. A HOME
+/// banner is artwork only — the Home hero paints its own heading, search box
+/// and buttons over it — which is why `title` had to become optional below.
+enum WebBannerPlacement {
+  HOME
+  CITY
+}
+
+model WebBanner {
+  id       String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// Small kicker above the title, e.g. "CARE+". Optional.
+  badge    String? @db.VarChar(40)
+  /// Required for a CITY banner, which renders this as its headline. Null is
+  /// allowed for a HOME banner, whose artwork carries its own words — see
+  /// `WebBannerPlacement`. Enforced per placement in the validation layer, not
+  /// here, because the database has no way to express "required when".
+  title    String? @db.VarChar(120)
+  subtitle String? @db.VarChar(200)
+  /// Path under `/uploads`, from the CMS image upload.
+  imageUrl String  @map("image_url")
+
+  placement WebBannerPlacement @default(CITY)
+
+  /// The promoted Package. When set, the slide shows that package's live
+  /// (city-scoped) price and parameter count and links to its detail page.
+  /// Null for a pure promo slide — no price block, and `linkUrl` decides
+  /// where it goes. `SetNull` rather than `Cascade`: deleting a package must
+  /// not silently delete the banner an admin built around it; it degrades to
+  /// a promo slide instead, visibly, so someone fixes it.
+  packageId String? @map("package_id") @db.Uuid
+  /// Where the slide leads when no package is attached — a site-relative
+  /// path like "/packages/jaipur/full-body". Ignored when `packageId` is set.
+  linkUrl   String? @map("link_url")
+
+  sortOrder Int      @default(0) @map("sort_order")
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  package Package? @relation(fields: [packageId], references: [id], onDelete: SetNull)
+
+  /// Both mastheads read "active, in sort order, for MY placement", so the
+  /// placement leads the index.
+  @@index([placement, isActive, sortOrder])
+  @@index([packageId])
+  @@map("web_banners")
+}
+
+/// One Q&A shown in the Home page's FAQ accordion — individually
+/// manageable/reorderable, unlike `CmsPage` (a full standalone HTML page).
+/// `question`/`answer` may contain a literal `{city}` token, substituted by
+/// the patient app at render time with the patient's selected city name
+/// (falls back to a generic "your city" when none is picked) — this is why
+/// there's no per-city row here, one FAQ list serves every city.
+model HomeFaq {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  question  String   @db.VarChar(300)
+  answer    String
+  sortOrder Int      @default(0) @map("sort_order")
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("home_faqs")
+}
+
+/// Singleton row (fixed id, same pattern as `ReportSettings`/`PaymentGatewayConfig`
+/// above) holding the editable SEO paragraph block on the Home page (the
+/// "Quality Diagnostic Matters!"-style intro text competitors show above their
+/// FAQ) — `body` may contain a literal `{city}` token, substituted the same
+/// way `HomeFaq.question`/`answer` are. GET auto-creates the default row if
+/// missing, no seed migration needed.
+model HomeSeoContent {
+  id        String   @id @default("default") @db.VarChar(20)
+  heading   String   @db.VarChar(200)
+  body      String
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("home_seo_content")
+}
+
+/// Home-screen health-condition category tile. Named `AppCategory` (not
+/// `Category`) to avoid colliding with the existing lab-department
+/// `Category` model above — an unrelated, admin-side concept.
+model AppCategory {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name         String   @db.VarChar(150)
+  imageUrl     String?  @map("image_url")
+  thumbnailUrl String?  @map("thumbnail_url")
+  sortOrder    Int      @default(0) @map("sort_order")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  parameters Parameter[]
+  tests      Test[]
+  packages   Package[]
+
+  @@map("app_categories")
+}
+
+enum CouponDiscountType {
+  FLAT
+  PERCENTAGE
+}
+
+model Coupon {
+  id                  String                    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code                String                    @unique @db.VarChar(30)
+  /// Display title for the Home "Popular Coupons" tile (e.g. "Off on tests")
+  /// — the code itself is a redemption key, not a user-facing label.
+  title               String                    @default("Special Offer") @db.VarChar(150)
+  discountType        CouponDiscountType        @map("discount_type")
+  discountValue       Decimal                   @map("discount_value") @db.Decimal(10, 2)
+  maxDiscountAmount   Decimal?                  @map("max_discount_amount") @db.Decimal(10, 2)
+  minSubtotal         Decimal?                  @map("min_subtotal") @db.Decimal(10, 2)
+  /// Display-only categorization for the Home tile — NOT enforced at
+  /// redemption time (checkCouponEligibility does not filter by this).
+  applicableOn        CouponApplicableOn        @default(ALL) @map("applicable_on")
+  /// UNLIKE `applicableOn`, this IS enforced at redemption time (see
+  /// `checkCouponEligibility`) — an app-exclusive discount code only works
+  /// from a request carrying the app's `platform` header (ANDROID/IOS), and
+  /// a web-only one only from a plain browser request (no header, "WEB").
+  platformRestriction CouponPlatformRestriction @default(ALL) @map("platform_restriction")
+  validFrom           DateTime?                 @map("valid_from")
+  validTo             DateTime?                 @map("valid_to")
+  usageLimitPerUser   Int?                      @map("usage_limit_per_user")
+  totalUsageLimit     Int?                      @map("total_usage_limit")
+  isActive            Boolean                   @default(true) @map("is_active")
+  /// Featured on the patient app Home screen's "Popular Coupons" section.
+  showOnHome          Boolean                   @default(false) @map("show_on_home")
+  /// Display order among `showOnHome` coupons only — same server-computed,
+  /// reorder-endpoint convention as Banner.sortOrder/AppCategory.sortOrder.
+  homeSortOrder       Int                       @default(0) @map("home_sort_order")
+  createdAt           DateTime                  @default(now()) @map("created_at")
+  updatedAt           DateTime                  @updatedAt @map("updated_at")
+
+  carts       Cart[]
+  redemptions CouponRedemption[]
+  orders      AppOrder[]
+
+  @@map("app_coupons")
+}
+
+enum CouponApplicableOn {
+  ALL
+  TESTS
+  PACKAGES
+}
+
+enum CouponPlatformRestriction {
+  ALL
+  APP_ONLY
+  WEB_ONLY
+}
+
+model CouponRedemption {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  couponId       String   @map("coupon_id") @db.Uuid
+  appUserId      String   @map("app_user_id") @db.Uuid
+  orderId        String?  @map("order_id") @db.Uuid
+  discountAmount Decimal  @map("discount_amount") @db.Decimal(10, 2)
+  redeemedAt     DateTime @default(now()) @map("redeemed_at")
+
+  coupon Coupon    @relation(fields: [couponId], references: [id], onDelete: Cascade)
+  order  AppOrder? @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  @@index([couponId])
+  @@index([appUserId])
+  @@map("app_coupon_redemptions")
+}
+
+/// One cart per AppUser, reused across its lifetime — items are cleared (not
+/// the Cart row itself) once an order is confirmed.
+model Cart {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  appUserId String   @unique @map("app_user_id") @db.Uuid
+  couponId  String?  @map("coupon_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  appUser AppUser    @relation(fields: [appUserId], references: [id], onDelete: Cascade)
+  coupon  Coupon?    @relation(fields: [couponId], references: [id], onDelete: SetNull)
+  items   CartItem[]
+
+  @@map("app_carts")
+}
+
+enum CatalogItemType {
+  TEST
+  PACKAGE
+}
+
+/// `itemId` is a polymorphic reference (to `tests.id` or `packages.id`
+/// depending on `itemType`) rather than two nullable FK columns — mirrors
+/// the client's own existing `type`/`type_id` cart-mutation contract.
+model CartItem {
+  id             String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  cartId         String          @map("cart_id") @db.Uuid
+  itemType       CatalogItemType @map("item_type")
+  itemId         String          @map("item_id") @db.Uuid
+  familyMemberId String?         @map("family_member_id") @db.Uuid
+  createdAt      DateTime        @default(now()) @map("created_at")
+
+  cart         Cart          @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  familyMember FamilyMember? @relation(fields: [familyMemberId], references: [id], onDelete: SetNull)
+
+  @@unique([cartId, itemType, itemId, familyMemberId])
+  @@index([cartId])
+  @@map("app_cart_items")
+}
+
+/// A physical lab branch / diagnostic center the app lists for nearby-labs
+/// browsing and slot scoping. Facilities/payment-methods/photos are simple
+/// read-only display lists with no independent querying need, so they're
+/// plain JSON arrays rather than three extra join tables.
+model ServiceCenter {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name           String   @db.VarChar(150)
+  imageUrl       String?  @map("image_url")
+  address        String
+  phone          String?  @db.VarChar(15)
+  email          String?  @db.VarChar(255)
+  website        String?
+  latitude       Decimal  @db.Decimal(10, 7)
+  longitude      Decimal  @db.Decimal(10, 7)
+  rating         Decimal  @default(0) @db.Decimal(2, 1)
+  reviewCount    Int      @default(0) @map("review_count")
+  openingTime    String?  @map("opening_time") @db.VarChar(10)
+  closingTime    String?  @map("closing_time") @db.VarChar(10)
+  centerType     String?  @map("center_type") @db.VarChar(50)
+  isActive       Boolean  @default(true) @map("is_active")
+  facilities     Json     @default("[]")
+  paymentMethods Json     @default("[]") @map("payment_methods")
+  photos         Json     @default("[]")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  /// The franchise this lab card belongs to — set from Superadmin so a
+  /// patient tapping "Book Now" on this card routes their booking to this
+  /// specific franchise's dashboard (see `AppOrder.serviceCenterId` and
+  /// `franchiseOrderScope`), instead of only the area/city-based match every
+  /// other order relies on. NULL = this lab card isn't tied to any one
+  /// franchise yet.
+  organizationId String? @map("organization_id") @db.Uuid
+
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+  slots        Slot[]
+  bookedOrders AppOrder[]
+
+  @@index([organizationId])
+  @@map("app_service_centers")
+}
+
+model Slot {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  centerId        String?  @map("center_id") @db.Uuid
+  slotDate        DateTime @map("slot_date") @db.Date
+  startTime       String   @map("start_time") @db.VarChar(5)
+  endTime         String   @map("end_time") @db.VarChar(5)
+  capacity        Int      @default(1)
+  bookedCount     Int      @default(0) @map("booked_count")
+  surchargeAmount Decimal  @default(0) @map("surcharge_amount") @db.Decimal(10, 2)
+  isBlocked       Boolean  @default(false) @map("is_blocked")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  center ServiceCenter? @relation(fields: [centerId], references: [id], onDelete: SetNull)
+  orders AppOrder[]
+
+  @@unique([centerId, slotDate, startTime])
+  @@index([slotDate])
+  @@map("app_slots")
+}
+
+// ---------------------------------------------------------------------------
+// Slot Template system (city/area/phlebotomist-wise slot management) — the
+// `Slot`/`ServiceCenter` model above is the LEGACY engine, kept forever for
+// historical `AppOrder.slotId` references and for any City still on
+// `useNewSlotSystem=false`. The models below are the new engine: reusable
+// templates assigned to cities (no per-day slot creation), with layered
+// blocking (Holiday > AreaSlotBlock > SlotBlock) and capacity DERIVED from
+// active phlebotomist coverage per area, not a fixed stored counter. See
+// `services/slotAvailability.service.ts` for the resolver that reads all of
+// this; `AppOrder.slotTemplateId`/`areaId` above are what a new-engine
+// booking sets instead of the legacy `slotId`.
+// ---------------------------------------------------------------------------
+
+/// A sub-division of a City every patient Address can belong to (e.g.
+/// Vaishali Nagar/Mansarovar within Jaipur) — the unit slot-blocking and
+/// phlebotomist-coverage are actually scoped to. City-level config only
+/// determines which slot templates exist for the city; Area is where
+/// blocking/capacity/coverage happens.
+model Area {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  cityId           String   @map("city_id") @db.Uuid
+  name             String   @db.VarChar(100)
+  /// Resolution aid only (matching a patient Address's pincode to an Area)
+  /// — never a uniqueness constraint, since pincodes can legitimately span
+  /// areas in reality.
+  pincodes         String[] @default([])
+  isActive         Boolean  @default(true) @map("is_active")
+  /// Override for the city's `phlebotomyCharge` — null means "inherit the
+  /// city's default charge" (see reviewCart's resolvePhlebotomyCharge).
+  phlebotomyCharge Decimal? @map("phlebotomy_charge") @db.Decimal(10, 2)
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  city City @relation(fields: [cityId], references: [id], onDelete: Restrict)
+
+  addresses         Address[]
+  areaSlotBlocks    AreaSlotBlock[]
+  phlebotomistAreas PhlebotomistServiceArea[]
+  orders            AppOrder[]
+  organizations     OrganizationServiceArea[]
+  /// Set only on the `AreaApprovalRequest` whose approval actually created
+  /// this row — most areas were made directly from Superadmin and have none.
+  approvalRequests  AreaApprovalRequest[]
+
+  @@unique([cityId, name])
+  @@index([cityId])
+  @@map("app_areas")
+}
+
+enum AreaApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+/// A franchise's self-service request to expand its own coverage with a new
+/// Area in its own city — "Franchises > Area Approval" didn't exist before a
+/// franchise could propose new coverage itself; area creation was previously
+/// an admin-only action from Cities & Areas. Nothing about the catalogue
+/// changes until an admin reviews this: approving creates the real `Area`
+/// row (stamping `approvedAreaId` back onto this request) and immediately
+/// assigns it to the requesting franchise (`OrganizationServiceArea`) in the
+/// same step, since expanding coverage is the whole point of asking;
+/// rejecting just records `rejectionReason` and creates nothing.
+model AreaApprovalRequest {
+  id               String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId   String             @map("organization_id") @db.Uuid
+  cityId           String             @map("city_id") @db.Uuid
+  name             String             @db.VarChar(100)
+  pincodes         String[]           @default([])
+  status           AreaApprovalStatus @default(PENDING)
+  rejectionReason  String?            @map("rejection_reason")
+  /// The real `Area` row this request produced — set only once APPROVED.
+  approvedAreaId   String?            @map("approved_area_id") @db.Uuid
+  reviewedByUserId String?            @map("reviewed_by_user_id") @db.Uuid
+  reviewedAt       DateTime?          @map("reviewed_at")
+  createdAt        DateTime           @default(now()) @map("created_at")
+  updatedAt        DateTime           @updatedAt @map("updated_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  city         City         @relation(fields: [cityId], references: [id], onDelete: Cascade)
+  approvedArea Area?        @relation(fields: [approvedAreaId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId])
+  @@index([cityId])
+  @@index([status])
+  @@map("area_approval_requests")
+}
+
+/// A reusable slot definition (e.g. "08:00 - 10:00") assigned to cities via
+/// CitySlotTemplate rather than materialized per-date — this is the core of
+/// "admin should NOT create slots every day." `defaultCapacity` is
+/// ADVISORY/DISPLAY ONLY: real booking capacity is always derived from
+/// active phlebotomist coverage of the area (see PhlebotomistServiceArea),
+/// never this stored number.
+model SlotTemplate {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  title           String   @db.VarChar(100)
+  startTime       String   @map("start_time") @db.VarChar(5)
+  endTime         String   @map("end_time") @db.VarChar(5)
+  defaultCapacity Int      @default(1) @map("default_capacity")
+  active          Boolean  @default(true)
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  cityAssignments CitySlotTemplate[]
+  slotBlocks      SlotBlock[]
+  areaSlotBlocks  AreaSlotBlock[]
+  orders          AppOrder[]
+
+  @@map("slot_templates")
+}
+
+/// Assigning a template to a city is what makes it apply to ALL future
+/// dates for that city — no per-day insert. A city with zero active rows
+/// here is "unconfigured": the availability engine returns everything
+/// blocked for it. `onDelete: Restrict` on slotTemplate deliberately
+/// prevents hard-deleting a template still assigned somewhere.
+model CitySlotTemplate {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  cityId         String   @map("city_id") @db.Uuid
+  slotTemplateId String   @map("slot_template_id") @db.Uuid
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  city         City         @relation(fields: [cityId], references: [id], onDelete: Cascade)
+  slotTemplate SlotTemplate @relation(fields: [slotTemplateId], references: [id], onDelete: Restrict)
+
+  @@unique([cityId, slotTemplateId])
+  @@index([cityId])
+  @@index([slotTemplateId])
+  @@map("city_slot_templates")
+}
+
+/// Admin manually blocks a specific template-slot for a specific city+date
+/// (city-wide, not area-scoped — see AreaSlotBlock for that). Plain
+/// insert/hard-delete-to-unblock, no soft delete: a block's only meaning is
+/// "does a row exist for this date," nothing downstream needs it to persist
+/// once lifted or once the date has passed.
+model SlotBlock {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  cityId         String   @map("city_id") @db.Uuid
+  slotTemplateId String   @map("slot_template_id") @db.Uuid
+  blockDate      DateTime @map("block_date") @db.Date
+  reason         String?
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  city         City         @relation(fields: [cityId], references: [id], onDelete: Cascade)
+  slotTemplate SlotTemplate @relation(fields: [slotTemplateId], references: [id], onDelete: Cascade)
+
+  @@unique([cityId, slotTemplateId, blockDate])
+  @@index([cityId, blockDate])
+  @@map("slot_blocks")
+}
+
+/// A city+date with a row here has EVERY slot blocked, unconditionally —
+/// highest priority in the availability waterfall. Same
+/// insert/hard-delete-to-unblock convention as SlotBlock.
+model Holiday {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  cityId      String   @map("city_id") @db.Uuid
+  holidayDate DateTime @map("holiday_date") @db.Date
+  reason      String
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  city City @relation(fields: [cityId], references: [id], onDelete: Cascade)
+
+  @@unique([cityId, holidayDate])
+  @@map("holidays")
+}
+
+/// Blocks a specific slot in ONE Area (not the whole city) for a date —
+/// priority sits between Holiday and the city-wide SlotBlock.
+model AreaSlotBlock {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  areaId         String   @map("area_id") @db.Uuid
+  slotTemplateId String   @map("slot_template_id") @db.Uuid
+  blockDate      DateTime @map("block_date") @db.Date
+  reason         String?
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  area         Area         @relation(fields: [areaId], references: [id], onDelete: Cascade)
+  slotTemplate SlotTemplate @relation(fields: [slotTemplateId], references: [id], onDelete: Cascade)
+
+  @@unique([areaId, slotTemplateId, blockDate])
+  @@index([areaId, blockDate])
+  @@map("area_slot_blocks")
+}
+
+/// Singleton row (fixed id, same pattern as ReportSettings/
+/// PaymentGatewayConfig) — on/off switch for each of the slot-availability
+/// waterfall's 7 checks (see slotAvailability.service.ts#
+/// resolveSlotAvailability, which reads this and skips a step entirely when
+/// its flag is off, moving straight to the next one). Every flag defaults
+/// `false` (check disabled) so this ships with zero behaviour change until
+/// Superadmin explicitly turns checks on from Slot Management > Settings.
+/// GET auto-creates the default row if missing, no seed needed.
+model SlotAvailabilitySettings {
+  id String @id @default("default") @db.VarChar(20)
+
+  /// Step 1 — block if the city has no active slot-template assignment.
+  /// Currently unreachable from either caller (both already only invoke the
+  /// waterfall for assignments they've confirmed active), kept for parity
+  /// with the other 6 steps and in case a future caller changes that.
+  checkCityConfigured       Boolean @default(false) @map("check_city_configured")
+  /// Step 2 — block on the city's declared Holiday for that date.
+  checkHoliday              Boolean @default(false) @map("check_holiday")
+  /// Step 3 — block when the patient's address couldn't be resolved to an Area.
+  checkAreaResolved         Boolean @default(false) @map("check_area_resolved")
+  /// Step 4 — block on an Area-level manual block for that template/date.
+  checkAreaBlock            Boolean @default(false) @map("check_area_block")
+  /// Step 5 — block on a city-wide manual block for that template/date.
+  checkSlotBlock            Boolean @default(false) @map("check_slot_block")
+  /// Step 6 — block when no active Phlebotomist's working hours cover the
+  /// template's time range in that Area.
+  checkPhlebotomistCoverage Boolean @default(false) @map("check_phlebotomist_coverage")
+  /// Step 7 — block once booked count reaches covering-phlebotomist count.
+  checkCapacity             Boolean @default(false) @map("check_capacity")
+
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("slot_availability_settings")
+}
+
+/// Which Areas a Phlebotomist covers — capacity for a slot template in an
+/// area is derived by counting active phlebotomists here whose working
+/// hours contain the template's time range (see slotAvailability.service.ts).
+model PhlebotomistServiceArea {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  phlebotomistId String   @map("phlebotomist_id") @db.Uuid
+  areaId         String   @map("area_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  phlebotomist Phlebotomist @relation(fields: [phlebotomistId], references: [id], onDelete: Cascade)
+  area         Area         @relation(fields: [areaId], references: [id], onDelete: Cascade)
+
+  @@unique([phlebotomistId, areaId])
+  @@index([areaId])
+  @@index([phlebotomistId])
+  @@map("phlebotomist_service_areas")
+}
+
+/// Which client placed the request — WEB is the catch-all for anything that
+/// isn't the Flutter app's own `android`/`ios` header value (missing header,
+/// unrecognized value, or a genuine web client).
+enum AppPlatform {
+  ANDROID
+  IOS
+  WEB
+  /// Booked through the WhatsApp assistant (`services/whatsapp/`).
+  WHATSAPP
+}
+
+enum AppOrderStatus {
+  PENDING
+  CONFIRMED
+  /// Phlebo App workflow states — a phlebo accepts/rejects an assigned
+  /// order, then starts traveling, before physically reaching (REACHED,
+  /// pre-existing). REJECTED is the phlebo declining, distinct from
+  /// CANCELLED (patient/admin-initiated).
+  ACCEPTED
+  STARTED_JOURNEY
+  REJECTED
+  REACHED
+  SAMPLE_COLLECTED
+  /// Phlebo has dropped the collected sample off at the lab — the phlebo's
+  /// own last action. COMPLETED (below) stays admin/lab-only, set once the
+  /// report workflow actually finishes, not by the phlebo.
+  SAMPLE_DROPPED
+  COMPLETED
+  CANCELLED
+}
+
+enum AppOrderType {
+  CATALOG
+  HOME_VISIT
+}
+
+enum AppPaymentMode {
+  CASH
+  ONLINE
+}
+
+/// One checkout — wraps one-or-more real `Appointment`s (one per family
+/// member in the cart; LIMS's `Appointment` is one-patient-per-row). The
+/// booked tests/billing themselves live entirely in the existing
+/// `Appointment`/`AppointmentTest`/`Bill`/`Payment` tables via
+/// `AppOrderAppointment` below — this row only carries order-level
+/// concerns (address, slot, coupon, payment, lifecycle) LIMS has no
+/// equivalent of. `isDraft=true` rows are created at Review Cart time
+/// (so `order_id`/`order_number` exist for the client) and have no
+/// Appointments yet; Confirm Order creates the Appointments and flips it.
+model AppOrder {
+  id                      String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderNumber             String          @unique @map("order_number") @db.VarChar(20)
+  appUserId               String          @map("app_user_id") @db.Uuid
+  /// CATALOG (default) = the patient picked concrete tests/packages at
+  /// checkout, exactly like every pre-existing order. HOME_VISIT = the patient
+  /// only described a symptom (`symptomNotes`); no `AppOrderItem` exists yet —
+  /// the assigned phlebotomist decides what to test for once they've actually
+  /// examined the patient, via the "add tests" action (phlebo app or the
+  /// Superadmin fallback), which is what first creates this order's
+  /// Appointment/Bill/AppOrderItem rows and fills in `subtotal`/`totalPayable`.
+  orderType               AppOrderType    @default(CATALOG) @map("order_type")
+  /// Free-text complaint captured at booking time for a HOME_VISIT order —
+  /// what the phlebotomist reads before the visit so they know what to ask
+  /// about. Unused (null) for a CATALOG order.
+  symptomNotes            String?         @map("symptom_notes")
+  /// Who a HOME_VISIT order is for — set at booking time, before any
+  /// AppOrderItem (and thus before any AppOrderAppointment) exists to carry
+  /// that link. Once the phlebo adds tests this is who the resulting
+  /// Appointment/AppOrderItem rows get created against; left null forever on
+  /// a CATALOG order, where AppOrderItem.familyMemberId already carries it.
+  homeVisitFamilyMemberId String?         @map("home_visit_family_member_id") @db.Uuid
+  addressId               String?         @map("address_id") @db.Uuid
+  slotId                  String?         @map("slot_id") @db.Uuid
+  orderDate               DateTime        @map("order_date") @db.Date
+  status                  AppOrderStatus  @default(PENDING)
+  isDraft                 Boolean         @default(true) @map("is_draft")
+  /// Nullable — set by an admin via the Superadmin Order Management panel;
+  /// null means "unassigned" and is exactly the state that produces
+  /// `phlebotomist: null` in the app's Get Order Detail response today.
+  phleboId                String?         @map("phlebo_id") @db.Uuid
+  subtotal                Decimal         @default(0) @db.Decimal(10, 2)
+  phlebotomyCharges       Decimal         @default(0) @map("phlebotomy_charges") @db.Decimal(10, 2)
+  walletDiscount          Decimal         @default(0) @map("wallet_discount") @db.Decimal(10, 2)
+  couponId                String?         @map("coupon_id") @db.Uuid
+  couponDiscount          Decimal         @default(0) @map("coupon_discount") @db.Decimal(10, 2)
+  totalPayable            Decimal         @default(0) @map("total_payable") @db.Decimal(10, 2)
+  paymentMode             AppPaymentMode? @map("payment_mode")
+  paymentStatus           PaymentStatus?  @map("payment_status")
+  servicePin              String?         @map("service_pin") @db.VarChar(10)
+  confirmedAt             DateTime?       @map("confirmed_at")
+  cancelledAt             DateTime?       @map("cancelled_at")
+  cancellationReason      String?         @map("cancellation_reason")
+  /// Phlebo App workflow fields — latest remarks/photo from a status
+  /// update (a single current value, not a history log), plus COD and
+  /// service-PIN verification timestamps the phlebo app surfaces as
+  /// `cod_payment_status`/`can_mark_cod_collected`/`pin_verified`.
+  phleboRemarks           String?         @map("phlebo_remarks")
+  phleboPhotoUrl          String?         @map("phlebo_photo_url")
+  codCollectedAt          DateTime?       @map("cod_collected_at")
+  pinVerifiedAt           DateTime?       @map("pin_verified_at")
+  expiresAt               DateTime?       @map("expires_at")
+  /// New Slot Template system fields — populated instead of `slotId` once
+  /// the order's city has `useNewSlotSystem=true`. `areaId` is a SNAPSHOT
+  /// of the chosen address's area at review-cart time (not re-resolved
+  /// live later), so a later address/area edit never retroactively shifts
+  /// which area's capacity an in-flight or historical order counts
+  /// against — same convention as AppOrderItem's price snapshotting.
+  /// `slotId` (old system) is left in place, untouched, unused by any
+  /// order that sets these instead.
+  slotTemplateId          String?         @map("slot_template_id") @db.Uuid
+  areaId                  String?         @map("area_id") @db.Uuid
+  /// Snapshot of the device that confirmed this booking — set once, at
+  /// Confirm Order time, unlike `AppUser.platform` which keeps updating.
+  platform                AppPlatform?
+  /// The franchise this order was placed through. NULL = a direct B2C app/web
+  /// order, which is every pre-existing row. A SNAPSHOT, like `areaId` above:
+  /// it is stamped at creation and never re-derived, so later reassigning a
+  /// patient to a different organization cannot retroactively move historical
+  /// orders (and revenue) between franchises.
+  ///
+  /// Denormalised on purpose. The org is reachable via
+  /// appointments -> appointment -> patient, but that path is unusable as a
+  /// query filter for the franchise dashboard and does not exist at all for
+  /// draft orders.
+  organizationId          String?         @map("organization_id") @db.Uuid
+  /// The "Nearest Lab" card (`ServiceCenter`) the patient tapped "Book Now"
+  /// on, if the booking came in through that flow — NULL for every other
+  /// order. Feeds `franchiseOrderScope` (via `ServiceCenter.organizationId`)
+  /// so this specific lab's franchise sees the booking regardless of
+  /// whether the patient's address area/city otherwise matches them.
+  serviceCenterId         String?         @map("service_center_id") @db.Uuid
+  createdAt               DateTime        @default(now()) @map("created_at")
+  updatedAt               DateTime        @updatedAt @map("updated_at")
+
+  appUser               AppUser        @relation(fields: [appUserId], references: [id], onDelete: Cascade)
+  homeVisitFamilyMember FamilyMember?  @relation(fields: [homeVisitFamilyMemberId], references: [id], onDelete: SetNull)
+  address               Address?       @relation(fields: [addressId], references: [id], onDelete: SetNull)
+  slot                  Slot?          @relation(fields: [slotId], references: [id], onDelete: SetNull)
+  slotTemplate          SlotTemplate?  @relation(fields: [slotTemplateId], references: [id], onDelete: SetNull)
+  area                  Area?          @relation(fields: [areaId], references: [id], onDelete: SetNull)
+  coupon                Coupon?        @relation(fields: [couponId], references: [id], onDelete: SetNull)
+  phlebotomist          Phlebotomist?  @relation(fields: [phleboId], references: [id], onDelete: SetNull)
+  organization          Organization?  @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+  serviceCenter         ServiceCenter? @relation(fields: [serviceCenterId], references: [id], onDelete: SetNull)
+
+  appointments      AppOrderAppointment[]
+  couponRedemptions CouponRedemption[]
+  payments          AppPayment[]
+  items             AppOrderItem[]
+  statusHistory     AppOrderStatusHistory[]
+  whatsappDraft     WhatsappBookingDraft?
+  followUpReminders FollowUpReminder[]
+
+  @@index([appUserId])
+  @@index([status])
+  @@index([phleboId])
+  @@index([slotTemplateId, orderDate, status])
+  @@index([areaId, orderDate, status])
+  @@index([organizationId, status])
+  @@index([organizationId, orderDate])
+  @@index([serviceCenterId])
+  @@map("app_orders")
+}
+
+/// Who moved an order to `ADMIN`-settable status (Superadmin Order
+/// Management's generic status dropdown) or `PHLEBO` (the phlebo app's own
+/// accept/journey/sample actions). Exists only to label each
+/// `AppOrderStatusHistory` row for the Order Detail timeline — no
+/// permission logic reads it.
+enum AppOrderStatusChangeSource {
+  ADMIN
+  PHLEBO
+  FRANCHISE
+}
+
+/// One row per tracked status transition — what actually gives Order
+/// Detail's timeline real "phlebo accepted at X, reached at Y, collected at
+/// Z" history instead of just the two fixed moments (`createdAt`/
+/// `confirmedAt`) the rest of `AppOrder` captures. Not every status gets a
+/// row: `PENDING`/`CONFIRMED` are covered by `createdAt`/`confirmedAt`
+/// already, and `CANCELLED` by `cancelledAt` — only the phlebo-workflow
+/// statuses (`ACCEPTED` through `COMPLETED`/`REJECTED`) are written here,
+/// by `appOrder.repository.ts#recordAppOrderStatusHistory`, so the two
+/// representations never show the same moment twice.
+model AppOrderStatusHistory {
+  id        String                     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId   String                     @map("order_id") @db.Uuid
+  order     AppOrder                   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  status    AppOrderStatus
+  source    AppOrderStatusChangeSource
+  changedAt DateTime                   @default(now()) @map("changed_at")
+
+  @@index([orderId])
+  @@map("app_order_status_history")
+}
+
+/// What the patient actually selected at checkout (a Test or a whole
+/// Package), captured verbatim at order-confirmation time. Kept separate
+/// from `AppointmentTest` because a Package there is expanded into its
+/// constituent tests for lab workflow/billing purposes — Order Detail needs
+/// to show "Full Body Checkup - ₹900", not the 4 tests it expands to.
+model AppOrderItem {
+  id             String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId        String          @map("order_id") @db.Uuid
+  familyMemberId String          @map("family_member_id") @db.Uuid
+  itemType       CatalogItemType @map("item_type")
+  itemId         String          @map("item_id") @db.Uuid
+  name           String          @db.VarChar(200)
+  price          Decimal         @db.Decimal(10, 2)
+  createdAt      DateTime        @default(now()) @map("created_at")
+
+  order        AppOrder     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  familyMember FamilyMember @relation(fields: [familyMemberId], references: [id], onDelete: Restrict)
+
+  @@index([orderId])
+  @@map("app_order_items")
+}
+
+/// Minimal phlebotomist record — just enough to assign one to an AppOrder
+/// and populate the `phlebotomist` object api.md's Get Order Detail already
+/// contracts (currently hardcoded null since this model didn't exist).
+/// Deliberately scoped to admin/order-assignment needs only: no attendance,
+/// payout, or live-location tracking — that's a separate future module.
+model Phlebotomist {
+  id                      String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name                    String    @db.VarChar(150)
+  mobile                  String    @unique @db.VarChar(15)
+  photoUrl                String?   @map("photo_url")
+  isActive                Boolean   @default(true) @map("is_active")
+  /// Onboarding fields for the Phlebo App's own login (OTP by `mobile`,
+  /// separate from the admin/staff and patient-app logins) — nullable since
+  /// existing rows are admin-created with just name/mobile/photoUrl.
+  email                   String?   @db.VarChar(255)
+  gender                  Gender?
+  dob                     DateTime? @db.Date
+  address                 String?
+  isProfileComplete       Boolean   @default(false) @map("is_profile_complete")
+  /// Slot Template system fields: the phlebo's home city, service areas
+  /// (via PhlebotomistServiceArea), and daily working-hours window — used
+  /// to derive per-area slot capacity (see SlotTemplate below). Same
+  /// every-day window, not per-weekday, matching this model's existing
+  /// flat-field style; nullable since existing rows predate this.
+  cityId                  String?   @map("city_id") @db.Uuid
+  workingHoursStart       String?   @map("working_hours_start") @db.VarChar(5)
+  workingHoursEnd         String?   @map("working_hours_end") @db.VarChar(5)
+  /// Device push token for Firebase Cloud Messaging, captured (when the
+  /// client sends one) on every OTP verify. Not yet read by anything; see
+  /// `services/notification.service.ts#sendCustomNotification`.
+  fcmToken                String?   @map("fcm_token")
+  /// Set only when a FRANCHISE portal user created this phlebo (from their
+  /// own Phlebotomists screen, scoped to their assigned service areas) —
+  /// null for every admin-created phlebo, which is every pre-existing row.
+  /// This is what lets the franchise's own Order Management assign-phlebo
+  /// picker show only phlebos that franchise created, rather than every
+  /// phlebo on the platform (see `phlebotomist.service.ts#listOwnPhlebotomists`).
+  createdByOrganizationId String?   @map("created_by_organization_id") @db.Uuid
+  createdAt               DateTime  @default(now()) @map("created_at")
+  updatedAt               DateTime  @updatedAt @map("updated_at")
+
+  city                  City?                     @relation(fields: [cityId], references: [id], onDelete: SetNull)
+  createdByOrganization Organization?             @relation(fields: [createdByOrganizationId], references: [id], onDelete: SetNull)
+  serviceAreas          PhlebotomistServiceArea[]
+  orders                AppOrder[]
+  notifications         PhleboNotification[]
+
+  @@index([cityId])
+  @@index([createdByOrganizationId])
+  @@map("phlebotomists")
+}
+
+/// What a phlebo's in-app notification is about. Deliberately its OWN enum
+/// rather than sharing `AppNotificationType`: that one is patient-facing
+/// (REPORT_READY, PROMO, PRESCRIPTION_STATUS — none of which a phlebo ever
+/// receives), and the two sides have no overlapping event in either
+/// direction. Values are UPPER_SNAKE in the DB and mapped to lower_snake for
+/// the API, same convention as `AppNotificationType`/`AppOrderStatus`.
+enum PhleboNotificationType {
+  /// An order was assigned to this phlebo (admin's Assign Phlebo action).
+  NEW_ASSIGNMENT
+  /// An order already on this phlebo's list was cancelled — by the patient
+  /// or by an admin — so they should stop travelling to it.
+  BOOKING_CANCELLED
+  /// An order was taken off this phlebo's list (admin re-assigned it to
+  /// someone else, or cleared the assignment).
+  BOOKING_UNASSIGNED
+  /// The patient moved an assigned booking to a different date/time slot.
+  /// The assignment itself is untouched — see `order.service.ts#rescheduleOrder`
+  /// — so this is the only thing telling the phlebo their job has moved.
+  BOOKING_RESCHEDULED
+}
+
+/// The phlebo app's in-app notification list — the `Notification` twin for
+/// the other side of the delivery. Kept as a separate table rather than
+/// making `Notification.appUserId` polymorphic: a phlebotomist is not an
+/// `AppUser`, that FK is a hard `onDelete: Cascade` to the patient table,
+/// and every existing patient query would have to learn to exclude a second
+/// kind of recipient. Two narrow tables, one owner each.
+///
+/// A row here is HISTORY, written whether or not a push token exists or the
+/// FCM send succeeds — same rule as the patient side (see
+/// `orderNotification.service.ts`'s doc-comment).
+model PhleboNotification {
+  id        String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  phleboId  String                 @map("phlebo_id") @db.Uuid
+  type      PhleboNotificationType
+  title     String
+  message   String
+  /// The `AppOrder.id` this is about, so the app can deep-link to the
+  /// booking on tap. Untyped/no FK for the same reason `Notification.targetId`
+  /// is: it's polymorphic by `type`, and a notification must outlive a
+  /// hard-deleted order rather than disappearing with it.
+  targetId  String?                @map("target_id") @db.Uuid
+  isRead    Boolean                @default(false) @map("is_read")
+  createdAt DateTime               @default(now()) @map("created_at")
+  readAt    DateTime?              @map("read_at")
+
+  phlebotomist Phlebotomist @relation(fields: [phleboId], references: [id], onDelete: Cascade)
+
+  /// Covers the only access pattern: this phlebo's list, newest first.
+  @@index([phleboId, createdAt])
+  @@map("phlebo_notifications")
+}
+
+/// What a franchise's in-app notification is about. Its own enum, same
+/// reasoning as `PhleboNotificationType` — a franchise's alerts are never
+/// the same event set as a patient's or a phlebo's. Starts with just the one
+/// event (`NEW_BOOKING` — a booking resolved to this franchise, whether via
+/// `franchiseOrderScope`'s area/service-center match or a direct
+/// `AppOrder.organizationId` stamp); more join as the portal grows.
+enum OrganizationNotificationType {
+  NEW_BOOKING
+}
+
+/// A franchise portal's in-app notification feed — the `Organization`-side
+/// mirror of `PhleboNotification`/`Notification` (AppUser). Exists so
+/// `resolveOwningOrganizationIds` (`franchiseOrderScope.ts`) has somewhere
+/// real to write to the moment a booking resolves to a franchise, instead of
+/// that resolution staying purely query-time (dashboard/order-list reads,
+/// never a stored event). SMS is a deliberate non-goal here — see
+/// `organizationNotification.service.ts`'s doc-comment for why.
+model OrganizationNotification {
+  id             String                       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String                       @map("organization_id") @db.Uuid
+  type           OrganizationNotificationType
+  title          String
+  message        String
+  /// The `AppOrder.id` this is about — untyped/no FK for the same reason
+  /// `PhleboNotification.targetId` is: a notification must outlive a
+  /// hard-deleted order rather than disappearing with it.
+  targetId       String?                      @map("target_id") @db.Uuid
+  isRead         Boolean                      @default(false) @map("is_read")
+  createdAt      DateTime                     @default(now()) @map("created_at")
+  readAt         DateTime?                    @map("read_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  /// Covers the only access pattern: this franchise's list, newest first.
+  @@index([organizationId, createdAt])
+  @@map("organization_notifications")
+}
+
+/// Which real `Appointment` under an `AppOrder` belongs to which family
+/// member — the join that lets one checkout fan out into several
+/// Appointments.
+model AppOrderAppointment {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId        String   @map("order_id") @db.Uuid
+  appointmentId  String   @unique @map("appointment_id") @db.Uuid
+  familyMemberId String   @map("family_member_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  order        AppOrder     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  appointment  Appointment  @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  familyMember FamilyMember @relation(fields: [familyMemberId], references: [id], onDelete: Restrict)
+
+  @@index([orderId])
+  @@map("app_order_appointments")
+}
+
+enum PaymentPurpose {
+  ORDER_PAYMENT
+  WALLET_RECHARGE
+  THIRD_PARTY_LAB_BALANCE
+}
+
+enum PaymentGatewayStatus {
+  INITIATED
+  SUCCESS
+  FAILED
+}
+
+/// Razorpay tracking row — created at Create Payment Order time, finalized
+/// by whichever of Verify Payment / the webhook arrives first. For
+/// `ORDER_PAYMENT`, success also inserts a row into the EXISTING `Payment`
+/// table (tied to the Appointment's `Bill`) so admin-side billing reports
+/// see it exactly like any other payment. For `WALLET_RECHARGE`, success
+/// credits `Wallet.balance` instead (no `Bill` involved).
+model AppPayment {
+  id                     String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  appUserId              String               @map("app_user_id") @db.Uuid
+  purpose                PaymentPurpose
+  orderId                String?              @map("order_id") @db.Uuid
+  walletRechargeId       String?              @map("wallet_recharge_id") @db.Uuid
+  /// Snapshot fields for the THIRD_PARTY_LAB_BALANCE purpose — the partner
+  /// lab (third-party) has no local FK to join against, so the
+  /// TestRegnID/UserFID/pre-payment AmountPaid are captured at order-create
+  /// time and replayed to ThirdPartyLabClient.updatePaymentStatus() on
+  /// finalize. Unused for ORDER_PAYMENT/WALLET_RECHARGE.
+  thirdPartyTestRegnId   Int?                 @map("third_party_test_regn_id")
+  thirdPartyUserFid      String?              @map("third_party_user_fid")
+  thirdPartyAmountBefore Decimal?             @map("third_party_amount_before") @db.Decimal(10, 2)
+  amount                 Decimal              @db.Decimal(10, 2)
+  currency               String               @default("INR") @db.VarChar(3)
+  gatewayOrderId         String?              @map("gateway_order_id") @db.VarChar(100)
+  gatewayPaymentId       String?              @map("gateway_payment_id") @db.VarChar(100)
+  gatewaySignature       String?              @map("gateway_signature")
+  status                 PaymentGatewayStatus @default(INITIATED)
+  signatureVerified      Boolean              @default(false) @map("signature_verified")
+  failureReason          String?              @map("failure_reason")
+  createdAt              DateTime             @default(now()) @map("created_at")
+  updatedAt              DateTime             @updatedAt @map("updated_at")
+
+  appUser        AppUser         @relation(fields: [appUserId], references: [id], onDelete: Cascade)
+  order          AppOrder?       @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  walletRecharge WalletRecharge? @relation(fields: [walletRechargeId], references: [id], onDelete: SetNull)
+
+  @@index([appUserId])
+  @@index([gatewayOrderId])
+  @@index([thirdPartyTestRegnId])
+  @@map("app_payments")
+}
+
+/// Idempotency/audit guard for Razorpay webhook deliveries (at-least-once).
+model WebhookEvent {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  gateway          String   @db.VarChar(30)
+  eventType        String   @map("event_type") @db.VarChar(50)
+  gatewayPaymentId String   @map("gateway_payment_id") @db.VarChar(100)
+  rawPayload       Json     @map("raw_payload")
+  processedAt      DateTime @default(now()) @map("processed_at")
+
+  @@unique([gateway, eventType, gatewayPaymentId])
+  @@map("app_webhook_events")
+}
+
+model Wallet {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  appUserId String   @unique @map("app_user_id") @db.Uuid
+  balance   Decimal  @default(0) @db.Decimal(10, 2)
+  currency  String   @default("INR") @db.VarChar(3)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  appUser      AppUser             @relation(fields: [appUserId], references: [id], onDelete: Cascade)
+  transactions WalletTransaction[]
+
+  @@map("app_wallets")
+}
+
+enum WalletTransactionType {
+  CREDIT
+  DEBIT
+}
+
+enum WalletTransactionSource {
+  RECHARGE
+  ORDER_PAYMENT
+  REFUND
+  BONUS
+  MANUAL_ADJUSTMENT
+}
+
+/// Append-only ledger — `Wallet.balance` must always equal the latest row's
+/// `balanceAfter` (reconciliation invariant), same convention as `Payment`
+/// being an append-only ledger against `Bill` above.
+model WalletTransaction {
+  id                String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  walletId          String                  @map("wallet_id") @db.Uuid
+  type              WalletTransactionType
+  amount            Decimal                 @db.Decimal(10, 2)
+  source            WalletTransactionSource
+  referenceId       String?                 @map("reference_id") @db.Uuid
+  /// Admin's typed reason — only set for `MANUAL_ADJUSTMENT` entries.
+  note              String?
+  /// Which admin (`User`) performed a manual adjustment — soft reference,
+  /// same convention as `ReportAuditLog.performedByUserId` (no FK relation).
+  performedByUserId String?                 @map("performed_by_user_id") @db.Uuid
+  balanceAfter      Decimal                 @map("balance_after") @db.Decimal(10, 2)
+  createdAt         DateTime                @default(now()) @map("created_at")
+
+  wallet Wallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
+
+  @@index([walletId])
+  @@map("app_wallet_transactions")
+}
+
+model RechargeOffer {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  rechargeAmount Decimal  @map("recharge_amount") @db.Decimal(10, 2)
+  creditAmount   Decimal  @map("credit_amount") @db.Decimal(10, 2)
+  bonusAmount    Decimal  @default(0) @map("bonus_amount") @db.Decimal(10, 2)
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  rechargeRequests WalletRecharge[]
+
+  @@map("app_recharge_offers")
+}
+
+enum WalletRechargeStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+model WalletRecharge {
+  id           String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  appUserId    String               @map("app_user_id") @db.Uuid
+  offerId      String?              @map("offer_id") @db.Uuid
+  amount       Decimal              @db.Decimal(10, 2)
+  bonusAmount  Decimal              @default(0) @map("bonus_amount") @db.Decimal(10, 2)
+  creditAmount Decimal              @map("credit_amount") @db.Decimal(10, 2)
+  status       WalletRechargeStatus @default(PENDING)
+  createdAt    DateTime             @default(now()) @map("created_at")
+  updatedAt    DateTime             @updatedAt @map("updated_at")
+
+  appUser  AppUser        @relation(fields: [appUserId], references: [id], onDelete: Cascade)
+  offer    RechargeOffer? @relation(fields: [offerId], references: [id], onDelete: SetNull)
+  payments AppPayment[]
+
+  @@index([appUserId])
+  @@map("app_wallet_recharges")
+}
+
+enum PrescriptionStatus {
+  SUBMITTED
+  APPROVED
+  REJECTED
+}
+
+model Prescription {
+  id              String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  appUserId       String             @map("app_user_id") @db.Uuid
+  familyMemberId  String?            @map("family_member_id") @db.Uuid
+  cityId          String?            @map("city_id") @db.Uuid
+  query           String?
+  fileUrl         String             @map("file_url")
+  status          PrescriptionStatus @default(SUBMITTED)
+  rejectionReason String?            @map("rejection_reason")
+  createdAt       DateTime           @default(now()) @map("created_at")
+  updatedAt       DateTime           @updatedAt @map("updated_at")
+  deletedAt       DateTime?          @map("deleted_at")
+
+  appUser      AppUser       @relation(fields: [appUserId], references: [id], onDelete: Cascade)
+  familyMember FamilyMember? @relation(fields: [familyMemberId], references: [id], onDelete: SetNull)
+  city         City?         @relation(fields: [cityId], references: [id], onDelete: SetNull)
+
+  @@index([appUserId])
+  @@map("app_prescriptions")
+}
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  CLOSED
+}
+
+/// Whether the patient is reporting a problem or just sharing feedback — the
+/// app's Feedback screen now asks for this directly instead of a free-text
+/// subject. Nullable so older rows and any client that still doesn't send it
+/// keep working exactly as before.
+enum SupportTicketType {
+  COMPLAINT
+  FEEDBACK
+}
+
+model SupportTicket {
+  id            String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  ticketNumber  String             @unique @map("ticket_number") @db.VarChar(20)
+  appUserId     String             @map("app_user_id") @db.Uuid
+  subject       String             @db.VarChar(255)
+  description   String
+  screenshotUrl String?            @map("screenshot_url")
+  /// Optional — see `SupportTicketType`'s doc-comment.
+  type          SupportTicketType?
+  status        TicketStatus       @default(OPEN)
+  createdAt     DateTime           @default(now()) @map("created_at")
+  updatedAt     DateTime           @updatedAt @map("updated_at")
+
+  appUser AppUser @relation(fields: [appUserId], references: [id], onDelete: Cascade)
+
+  @@index([appUserId])
+  @@map("app_support_tickets")
+}
+
+/// Single-row app configuration (force-update check + CMS links + support
+/// contacts) — service layer enforces exactly one row ever exists.
+model AppConfig {
+  id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  minSupportedVersion  String   @map("min_supported_version") @db.VarChar(20)
+  latestVersion        String   @map("latest_version") @db.VarChar(20)
+  forceUpdate          Boolean  @default(false) @map("force_update")
+  updateUrl            String?  @map("update_url")
+  blogUrl              String?  @map("blog_url")
+  faqUrl               String?  @map("faq_url")
+  privacyPolicyUrl     String?  @map("privacy_policy_url")
+  termsUrl             String?  @map("terms_url")
+  supportPhone         String?  @map("support_phone") @db.VarChar(20)
+  supportWhatsapp      String?  @map("support_whatsapp") @db.VarChar(20)
+  supportEmail         String?  @map("support_email") @db.VarChar(255)
+  /// Added for the Phlebo App's Terms/Privacy/Help-Support screens, which
+  /// need actual HTML content (not just a link out) — reusable by the
+  /// Patient App later too, since its own fields above are URL-only.
+  supportAddress       String?  @map("support_address")
+  helpWorkingHours     String?  @map("help_working_hours")
+  helpFaqs             Json     @default("[]") @map("help_faqs")
+  termsContent         String?  @map("terms_content")
+  privacyPolicyContent String?  @map("privacy_policy_content")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+
+  @@map("app_config")
+}
+
+enum CmsAppType {
+  USER
+  PHLEBO
+}
+
+enum CmsPageStatus {
+  DRAFT
+  PUBLISHED
+}
+
+/// Superadmin-authored static pages (About/Privacy/Terms/FAQs/etc.) for the
+/// Patient App (`USER`) and Phlebo App (`PHLEBO`), each independently keyed
+/// by a slug unique WITHIN its app type — e.g. `USER`+"about-us" and
+/// `PHLEBO`+"about-us" can coexist since their public URLs live under
+/// different prefixes (plain vs `/phlebo/...`, see cmsPublic routes).
+/// Distinct from `AppConfig.termsContent`/`privacyPolicyContent`/`helpFaqs`
+/// above (a legacy single-row fallback still used by the Phlebo app's
+/// authenticated `/sample-boy/terms-conditions` etc. endpoints) — this is the
+/// new multi-page, slug-routable CMS the Superadmin panel manages going
+/// forward; the two are not migrated into each other.
+model CmsPage {
+  id              String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  appType         CmsAppType    @map("app_type")
+  title           String        @db.VarChar(200)
+  slug            String        @db.VarChar(160)
+  content         String
+  metaTitle       String?       @map("meta_title") @db.VarChar(200)
+  metaDescription String?       @map("meta_description") @db.VarChar(300)
+  status          CmsPageStatus @default(DRAFT)
+  createdByUserId String?       @map("created_by_user_id") @db.Uuid
+  updatedByUserId String?       @map("updated_by_user_id") @db.Uuid
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+
+  @@unique([appType, slug])
+  @@index([appType, status])
+  @@map("cms_pages")
+}
+
+enum BlogPostStatus {
+  DRAFT
+  PUBLISHED
+}
+
+/// Patient-web's `/blog` + `/blog/:slug` content — Superadmin-authored,
+/// public/guest-readable once `PUBLISHED`. `body` is the article split into
+/// paragraphs (one Postgres text array entry per paragraph), matching how
+/// the pre-CMS content in `frontend/patient-web/src/data/blogPosts.ts` was
+/// already shaped — rendering code didn't need to change, only where the
+/// data comes from.
+model BlogPost {
+  id          String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  slug        String         @unique @db.VarChar(200)
+  title       String         @db.VarChar(200)
+  category    String         @db.VarChar(80)
+  readMinutes Int            @default(2) @map("read_minutes")
+  excerpt     String
+  body        String[]
+  /// Path under `/uploads` (or any absolute URL) — nullable because a draft
+  /// can be written before an image is picked.
+  imageUrl    String?        @map("image_url")
+  status      BlogPostStatus @default(DRAFT)
+  /// Only set the moment `status` first becomes `PUBLISHED` — unaffected by
+  /// later edits, so "Published 3 weeks ago" doesn't jump to "today" every
+  /// time someone fixes a typo.
+  publishedAt DateTime?      @map("published_at")
+  createdAt   DateTime       @default(now()) @map("created_at")
+  updatedAt   DateTime       @updatedAt @map("updated_at")
+
+  @@index([status, publishedAt])
+  @@index([category])
+  @@map("blog_posts")
+}
+
+/// One "Add Service Invoice" entry — a center expense/service invoice line,
+/// independent of the patient-billing (Bill/Payment) ledger above.
+model Expense {
+  id              String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  categoryId      String           @map("category_id") @db.Uuid
+  serviceId       String           @map("service_id") @db.Uuid
+  invoiceDate     DateTime         @map("invoice_date") @db.Date
+  quantity        Decimal          @default(1) @db.Decimal(10, 2)
+  rate            Decimal          @db.Decimal(10, 2)
+  amount          Decimal          @db.Decimal(10, 2)
+  paymentMode     PaymentMode      @map("payment_mode")
+  paymentType     ExpenseEntryType @default(DEBIT) @map("payment_type")
+  remarks         String?
+  createdByUserId String?          @map("created_by_user_id") @db.Uuid
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+
+  category ExpenseCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  service  ExpenseService  @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+
+  @@index([categoryId])
+  @@index([serviceId])
+  @@index([invoiceDate])
+  @@map("expenses")
+}
+
+/// A DLT-registered transactional SMS template. India requires the body of
+/// every transactional SMS to match a template pre-registered with the telecom
+/// operator 1:1 (variables aside), identified by its DLT Content ID — so
+/// `body` is the registered text verbatim, with `{name}`-style placeholders
+/// filled in at send time, and must never be reworded here without
+/// re-registering it. Seeded from the legacy PHP system's
+/// `sms_templates` table (same SMS Guru account and principal entity).
+/// `isActive` is the kill switch for one event's SMS without a deploy.
+model SmsTemplate {
+  /// Stable code-side key, e.g. `Order_Received_Admin` — kept identical to the
+  /// legacy `templete_name` so the two systems' logs read the same.
+  key           String   @id @db.VarChar(60)
+  dltTemplateId String   @map("dlt_template_id") @db.VarChar(30)
+  body          String
+  isActive      Boolean  @default(true) @map("is_active")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@map("sms_templates")
+}
+
+enum SmsLogStatus {
+  SENT
+  FAILED
+  /// Not attempted: template inactive, invalid number, provider not
+  /// configured, or a non-production environment.
+  SKIPPED
+}
+
+/// One row per transactional SMS attempt — the answer to "did the customer
+/// actually get the message?" without digging through server logs. `mobile`
+/// is stored in full on purpose: this table is admin-only and the number is
+/// already on the order it refers to.
+model SmsLog {
+  id          String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  templateKey String       @map("template_key") @db.VarChar(60)
+  mobile      String       @db.VarChar(15)
+  message     String
+  status      SmsLogStatus
+  /// Gateway response body, or the reason for FAILED/SKIPPED.
+  response    String?
+  /// The `AppOrder.id` this is about — no FK so a log survives the order.
+  orderId     String?      @map("order_id") @db.Uuid
+  createdAt   DateTime     @default(now()) @map("created_at")
+
+  @@index([orderId])
+  @@index([createdAt])
+  @@map("sms_logs")
+}
+
+// ─── WhatsApp assistant ──────────────────────────────────────────────────
+// A customer chats with the business number; an LLM with tools answers and
+// books through the same order code the app uses (see `services/whatsapp/`).
+// Every secret column ends in `Enc` and holds `crypto.util.ts` ciphertext —
+// never plaintext, never returned to the browser.
+
+/// One Meta WhatsApp Cloud API phone number. The webhook URL carries this
+/// row's id, so several numbers can share one backend.
+model WhatsappAccount {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  label          String    @default("Main") @db.VarChar(100)
+  phoneNumberId  String    @unique @map("phone_number_id") @db.VarChar(50)
+  wabaId         String?   @map("waba_id") @db.VarChar(50)
+  displayPhone   String?   @map("display_phone") @db.VarChar(20)
+  accessTokenEnc String?   @map("access_token_enc")
+  appSecretEnc   String?   @map("app_secret_enc")
+  verifyToken    String    @map("verify_token") @db.VarChar(100)
+  isActive       Boolean   @default(true) @map("is_active")
+  lastWebhookAt  DateTime? @map("last_webhook_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  conversations WhatsappConversation[]
+
+  @@map("whatsapp_accounts")
+}
+
+model WhatsappConversation {
+  id                     String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  accountId              String    @map("account_id") @db.Uuid
+  /// Normalised 10-digit Indian mobile when it is one, else the raw wa_id.
+  /// This — and only this — scopes every order/report lookup the AI makes.
+  contactPhone           String    @map("contact_phone") @db.VarChar(20)
+  /// Raw `wa_id` Meta sends (country code included) — what we send back to.
+  waId                   String    @map("wa_id") @db.VarChar(20)
+  contactName            String?   @map("contact_name") @db.VarChar(150)
+  appUserId              String?   @map("app_user_id") @db.Uuid
+  lastInboundAt          DateTime? @map("last_inbound_at")
+  lastMessageAt          DateTime? @map("last_message_at")
+  unreadCount            Int       @default(0) @map("unread_count")
+  /// Set the moment a staff member replies by hand — the AI stays silent
+  /// for this chat until staff hand it back.
+  humanTakeover          Boolean   @default(false) @map("human_takeover")
+  needsHuman             Boolean   @default(false) @map("needs_human")
+  handoffReason          String?   @map("handoff_reason") @db.VarChar(100)
+  handoffSummary         String?   @map("handoff_summary")
+  handoffAt              DateTime? @map("handoff_at")
+  /// Report-access check (patient DOB): wrong answers count up to 3, then
+  /// lock for 30 minutes; a pass is valid for a short window.
+  reportCheckFailures    Int       @default(0) @map("report_check_failures")
+  reportCheckLockedUntil DateTime? @map("report_check_locked_until")
+  reportVerifiedUntil    DateTime? @map("report_verified_until")
+  /// Customer replied STOP — no more follow-up reminders on WhatsApp.
+  remindersOptedOut      Boolean   @default(false) @map("reminders_opted_out")
+  createdAt              DateTime  @default(now()) @map("created_at")
+  updatedAt              DateTime  @updatedAt @map("updated_at")
+
+  account   WhatsappAccount        @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  appUser   AppUser?               @relation(fields: [appUserId], references: [id], onDelete: SetNull)
+  messages  WhatsappMessage[]
+  drafts    WhatsappBookingDraft[]
+  aiReplies WhatsappAiReply[]
+
+  @@unique([accountId, contactPhone])
+  @@index([needsHuman])
+  @@index([lastMessageAt])
+  @@map("whatsapp_conversations")
+}
+
+enum WhatsappDirection {
+  IN
+  OUT
+}
+
+enum WhatsappAuthor {
+  CUSTOMER
+  AI
+  STAFF
+  SYSTEM
+  TEMPLATE
+}
+
+model WhatsappMessage {
+  id             String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  conversationId String            @map("conversation_id") @db.Uuid
+  /// Meta's message id. Unique: a webhook redelivery of the same inbound
+  /// message fails the insert and is dropped, so it can never produce a
+  /// second reply or a second booking. Null only for an outbound send that
+  /// Meta rejected before assigning one.
+  wamid          String?           @unique @db.VarChar(255)
+  direction      WhatsappDirection
+  author         WhatsappAuthor
+  type           String            @db.VarChar(30)
+  body           String?
+  /// Interactive payload (buttons/list) we sent, or the reply id we got.
+  payload        Json?
+  status         String            @default("received") @db.VarChar(20)
+  error          String?
+  staffUserId    String?           @map("staff_user_id") @db.Uuid
+  sentAt         DateTime          @default(now()) @map("sent_at")
+  createdAt      DateTime          @default(now()) @map("created_at")
+
+  conversation WhatsappConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, sentAt])
+  @@map("whatsapp_messages")
+}
+
+enum WhatsappDraftStatus {
+  DRAFT
+  CONFIRMED
+  EXPIRED
+  CANCELLED
+}
+
+/// What the customer is about to book, held in the DB rather than only in
+/// the chat context. `confirm_booking` books from THIS row, never from model
+/// output; `appOrderId` is unique so one draft can never become two orders.
+model WhatsappBookingDraft {
+  id             String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  conversationId String              @map("conversation_id") @db.Uuid
+  payload        Json
+  /// sha256 of the summary the customer was shown — the Confirm button's id
+  /// carries it, so a confirm for a summary that has since changed is refused.
+  summaryHash    String              @map("summary_hash") @db.VarChar(64)
+  status         WhatsappDraftStatus @default(DRAFT)
+  appOrderId     String?             @unique @map("app_order_id") @db.Uuid
+  expiresAt      DateTime            @map("expires_at")
+  confirmedAt    DateTime?           @map("confirmed_at")
+  createdAt      DateTime            @default(now()) @map("created_at")
+  updatedAt      DateTime            @updatedAt @map("updated_at")
+
+  conversation WhatsappConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  appOrder     AppOrder?            @relation(fields: [appOrderId], references: [id], onDelete: SetNull)
+
+  @@index([conversationId, status])
+  @@map("whatsapp_booking_drafts")
+}
+
+/// One row per AI turn — what was asked, what was answered, which tools ran,
+/// and what it cost. Also written by the Superadmin "Try it" box (`dryRun`).
+model WhatsappAiReply {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  conversationId   String?  @map("conversation_id") @db.Uuid
+  inboundMessageId String?  @map("inbound_message_id") @db.Uuid
+  replyMessageId   String?  @map("reply_message_id") @db.Uuid
+  question         String?
+  answer           String?
+  toolCalls        Json?    @map("tool_calls")
+  model            String   @db.VarChar(50)
+  inputTokens      Int      @default(0) @map("input_tokens")
+  outputTokens     Int      @default(0) @map("output_tokens")
+  cacheReadTokens  Int      @default(0) @map("cache_read_tokens")
+  cacheWriteTokens Int      @default(0) @map("cache_write_tokens")
+  /// replied | skipped | handoff | error
+  status           String   @db.VarChar(20)
+  error            String?
+  handoff          Boolean  @default(false)
+  dryRun           Boolean  @default(false) @map("dry_run")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  conversation WhatsappConversation? @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+  @@index([createdAt])
+  @@index([status])
+  @@map("whatsapp_ai_replies")
+}
+
+/// Singleton (`id = "default"`), same shape as `PaymentGatewayConfig`.
+model WhatsappAiSettings {
+  id                   String   @id @default("default") @db.VarChar(20)
+  enabled              Boolean  @default(false)
+  anthropicKeyEnc      String?  @map("anthropic_key_enc")
+  model                String   @default("claude-haiku-5-5") @db.VarChar(50)
+  maxRepliesPerHour    Int      @default(20) @map("max_replies_per_hour")
+  voiceEnabled         Boolean  @default(true) @map("voice_enabled")
+  sttProvider          String   @default("groq") @map("stt_provider") @db.VarChar(20)
+  sttKeyEnc            String?  @map("stt_key_enc")
+  brandName            String   @default("Example Diagnostics Lab") @map("brand_name") @db.VarChar(100)
+  businessInstructions String   @default("") @map("business_instructions")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+
+  @@map("whatsapp_ai_settings")
+}
+
+/// FAQ facts the assistant may state. Only `isActive` rows reach the model.
+model WhatsappKnowledgeEntry {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  title     String   @db.VarChar(200)
+  body      String
+  isActive  Boolean  @default(false) @map("is_active")
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("whatsapp_knowledge_entries")
+}
+
+/// Medical-team-curated "concern → commonly ordered tests" table — the ONLY
+/// source the assistant may use for a symptom-based suggestion. Only
+/// `isActive` rows are searched.
+model ConcernTestMapping {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  concern    String   @db.VarChar(200)
+  keywords   String[] @default([])
+  testIds    String[] @default([]) @map("test_ids") @db.Uuid
+  packageIds String[] @default([]) @map("package_ids") @db.Uuid
+  notes      String?
+  isActive   Boolean  @default(false) @map("is_active")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@map("concern_test_mappings")
+}
+
+enum FollowUpStatus {
+  SCHEDULED
+  SENT
+  /// The patient booked the same item again before the reminder was due.
+  SKIPPED_REBOOKED
+  /// Not sent: opted out, no reachable number, or the item no longer exists.
+  SKIPPED
+  FAILED
+  /// Booked again after the reminder went out (conversion tracking).
+  BOOKED
+}
+
+/// "Repeat this test" reminder for one patient + one booked item, created
+/// when the order's report is ready and due `followUpDays` later.
+model FollowUpReminder {
+  id             String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  appUserId      String          @map("app_user_id") @db.Uuid
+  familyMemberId String          @map("family_member_id") @db.Uuid
+  orderId        String          @map("order_id") @db.Uuid
+  itemType       CatalogItemType @map("item_type")
+  itemId         String          @map("item_id") @db.Uuid
+  itemName       String          @map("item_name") @db.VarChar(200)
+  reportReadyAt  DateTime        @map("report_ready_at")
+  dueDate        DateTime        @map("due_date") @db.Date
+  status         FollowUpStatus  @default(SCHEDULED)
+  templateName   String?         @map("template_name") @db.VarChar(100)
+  pushSent       Boolean         @default(false) @map("push_sent")
+  whatsappStatus String?         @map("whatsapp_status") @db.VarChar(30)
+  error          String?
+  sentAt         DateTime?       @map("sent_at")
+  bookedOrderId  String?         @map("booked_order_id") @db.Uuid
+  createdAt      DateTime        @default(now()) @map("created_at")
+  updatedAt      DateTime        @updatedAt @map("updated_at")
+
+  appUser AppUser  @relation(fields: [appUserId], references: [id], onDelete: Cascade)
+  order   AppOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([orderId, familyMemberId, itemType, itemId])
+  @@index([status, dueDate])
+  @@index([appUserId])
+  @@map("follow_up_reminders")
+}
+
+/// An ad campaign landing page at `/offer/<slug>` on the website. Only the
+/// title, city, packages and the two banner images are configurable — the
+/// rest of the page is a fixed design (patient-web `pages/offer/`).
+model LandingPage {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// Internal name shown only in Superadmin.
+  name             String   @db.VarChar(150)
+  slug             String   @unique @db.VarChar(120)
+  /// The page's main heading.
+  title            String   @db.VarChar(150)
+  /// The city the page targets — sets the visitor's city (and so pricing and
+  /// serviceability). The page itself is open to anyone with the link.
+  cityId           String   @map("city_id") @db.Uuid
+  /// Paths under `/uploads`. Full-width, half the screen tall.
+  desktopBannerUrl String?  @map("desktop_banner_url")
+  mobileBannerUrl  String?  @map("mobile_banner_url")
+  validFrom        DateTime @map("valid_from")
+  validTo          DateTime @map("valid_to")
+  isActive         Boolean  @default(true) @map("is_active")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  city     City                 @relation(fields: [cityId], references: [id], onDelete: Restrict)
+  packages LandingPagePackage[]
+
+  @@index([cityId])
+  @@map("landing_pages")
+}
+
+model LandingPagePackage {
+  landingPageId String @map("landing_page_id") @db.Uuid
+  packageId     String @map("package_id") @db.Uuid
+  sortOrder     Int    @default(0) @map("sort_order")
+
+  landingPage LandingPage @relation(fields: [landingPageId], references: [id], onDelete: Cascade)
+  package     Package     @relation(fields: [packageId], references: [id], onDelete: Cascade)
+
+  @@id([landingPageId, packageId])
+  @@index([packageId])
+  @@map("landing_page_packages")
+}
